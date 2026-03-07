@@ -1,0 +1,1 @@
+auto detection of ptohos eighter real or ai generated
