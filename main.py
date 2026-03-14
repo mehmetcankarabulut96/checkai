@@ -1,12 +1,16 @@
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import httpx
+import os
+
+load_dotenv()
 
 app = FastAPI()
 
 # Sightengine cradentials
-SIGHTENGINE_USER = "793268268"
-SIGHTENGINE_SECRET = "vCnRhTqQ9K9TmXX4B6my4qPazXY7xR4S"
-API_URL = "https://api.sightengine.com/1.0/check.json"
+SIGHTENGINE_USER = os.getenv("SIGHTENGINE_USER")
+SIGHTENGINE_SECRET = os.getenv("SIGHTENGINE_SECRET")
+API_URL = os.getenv("API_URL")
 
 
 @app.post("/analyze")
