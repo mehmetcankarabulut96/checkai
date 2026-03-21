@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid
+import httpx, hashlib, os, uuid, secrets
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security
@@ -34,41 +34,80 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Token'ı header'dan almak için
-security = HTTPBearer()
-
+security = HTTPBearer(auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
 
-async def get_client_from_key(api_key: str = Security(api_key_header)):
-    if not api_key:
-        return None # normal user, JWT kontrolüne pasla
-    
-    # Gelen key'i hash'le ve DB'de ara
-    hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
-    result = supabase.table("api_keys").select("*").eq("key_hash", hashed_key).eq("is_active", True).execute()
-    
-    if not result.data:
-        raise HTTPException(status_code=403, detail="Geçersiz API Key")
-    
-    return result.data[0] # şirket
+# jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir
+async def get_auth_user(
+    api_key: str = Depends(api_key_header),
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    # x-api-key
+    if api_key:
+        hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
+        result = supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
+        
+        if result.data:
+            return {"id": result.data[0]["user_id"], "type": "company"}
+        
+    # jwt
+    if credentials:
+        try:
+            user_response = supabase.auth.get_user(credentials.credentials)
+            return {"id": user_response.user.id, "type": "individual"}
+        except:
+            pass
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
-    try:
-        # Token'ı doğrula ve kullanıcı bilgilerini al
-        user_response = supabase.auth.get_user(token)
-        return user_response.user
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Unauthorized: {str(e)}")
+    # unauthorized
+    raise HTTPException(status_code=401, detail="unauthorized")
     
+# jwt
+@app.post("/generate-api-key")
+async def generate_api_key(
+    current_user = Depends(get_auth_user)
+):
+    # check if user is a compan
+    profile = supabase.table("profiles").select("account_type").eq("id", current_user.id).single().execute()
+    
+    if not profile.data or profile.data.get("account_type") != "company":
+        raise HTTPException(
+            status_code=403, 
+            detail="Only companies can generate API Key"
+        )
+    
+    # create random key
+    raw_key = f"sk_live_{secrets.token_urlsafe(32)}"
+
+    # hash the key and create hint
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_hint = f"{raw_key[:8]}...{raw_key[-4:]}"
+
+    try:
+        db_data = {
+            "user_id": current_user.id,
+            "key_hash": key_hash,
+            "key_hint": key_hint
+        }
+        supabase.table("api_keys").insert(db_data).execute()
+
+        # raw_key only accessed from here
+        return {
+            "api_key": raw_key,
+            "key_hint": key_hint,
+            "message": "Save this key with safe. Cannot be read further."
+        }
+    except Exception as e:
+        print(f"Key Error: {e}")
+        raise HTTPException(status_code=500, detail="Key generation error")
+
+# jwt + api
 @app.post("/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
-    business_client = Depends(get_client_from_key), # API Key kontrolü
-    normal_client = Depends(get_current_user) # JWT kontrolü
+    auth = Depends(get_auth_user)
 ):
-    # Eğer api_client varsa şirket isteğidir, yoksa current_user üzerinden devam et
-    active_client_id = business_client["user_id"] if business_client else normal_client.id
-    
+    active_client_id = auth["id"]
+
     try:
         content = await file.read()
         
@@ -115,13 +154,13 @@ async def analyze_image(
         print(f"error details: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# jwt + api
 @app.get("/history")
 async def get_history(
-    business_client = Depends(get_client_from_key), # API Key kontrolü
-    normal_client = Depends(get_current_user) # JWT kontrolü
+    auth = Depends(get_auth_user)
 ):
     # Kim gelirse gelsin user_id'sini al
-    active_client_id = business_client["user_id"] if business_client else normal_client.id
+    active_client_id = auth["id"]
 
     try:
         # Sadece giriş yapan kullanıcıya ait verileri çek
@@ -135,22 +174,23 @@ async def get_history(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/health")
-def health_check():
-    return {"status": "online"}
-
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
+    account_type: str
 
-# TODO: profiles tablosu oluştur ve account_type = individual / company olarak ekle
 @app.post("/register")
 def register(user: UserRegister):
     try:
         # Supabase auth modülü parolayı kendisi şifreler
         response = supabase.auth.sign_up({
             "email": user.email,
-            "password": user.password
+            "password": user.password,
+            "options": {
+                "data": {
+                    "account_type": user.account_type
+                }
+            }
         })
 
         if response.user is None:
@@ -164,13 +204,15 @@ def register(user: UserRegister):
             "user": response.user
         }
     except Exception as e:
-        print(f"error details: {e}")
+        print(f"error details: {repr(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+# bu endpointi arayüz üzerinden giriş yapacak bireysel kullanıcılar ve şirket yetkilileri(admin paneli) kullanır
+# b2b uygulamalar login olmadan access-token ile istek yaparlar
 @app.post("/login")
 def login(user: UserLogin):
     try:
