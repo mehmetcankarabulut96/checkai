@@ -100,10 +100,10 @@ async def get_auth_user(
 async def generate_api_key(
     current_user = Depends(get_auth_user)
 ):
-    # check if user is a compan
-    profile = supabase.table("profiles").select("account_type").eq("id", current_user.id).single().execute()
-    
-    if not profile.data or profile.data.get("account_type") != "company":
+    # check if user is a company
+    response = supabase.table("profiles").select("account_type").eq("id", current_user["id"]).maybe_single().execute()
+
+    if not response or not response.data or response.data.get("account_type") != "company":
         raise HTTPException(
             status_code=403, 
             detail="Only companies can generate API Key"
