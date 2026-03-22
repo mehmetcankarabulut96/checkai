@@ -1,14 +1,22 @@
 
-import httpx, hashlib, os, uuid, secrets
+import httpx, hashlib, os, uuid, secrets, jwt, os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
+from starlette.requests import Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
+# security
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 load_dotenv()
 
@@ -32,6 +40,32 @@ API_URL = os.getenv("API_URL")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# b2b cradentials (Sadece X-API-KEY varsa dolu döner)
+def get_company_id(request: Request):
+    api_key = request.headers.get("X-API-KEY")
+    if api_key:
+        return f"key_{hashlib.md5(api_key.encode()).hexdigest()}"
+    return None # Bu limit atlanır
+
+# b2c cradentials (API Key yoksa çalışır)
+def get_individual_id(request: Request):
+    if request.headers.get("X-API-KEY"):
+        return None # Şirketse bu limiti atla
+    
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            token = auth_header.split(" ")[1]
+            payload = jwt.decode(token, options={"verify_signature": False})
+            return f"user_{payload.get('sub')}"
+        except: pass
+    return get_remote_address(request)
+
+# get_remote_address -> Eğer özel bir fonksiyon belirtilmezse IP'ye göre limit koyar
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Token'ı header'dan almak için
 security = HTTPBearer(auto_error=False)
@@ -60,7 +94,7 @@ async def get_auth_user(
 
     # unauthorized
     raise HTTPException(status_code=401, detail="unauthorized")
-    
+
 # jwt
 @app.post("/generate-api-key")
 async def generate_api_key(
@@ -102,12 +136,44 @@ async def generate_api_key(
 
 # jwt + api
 @app.post("/analyze")
+@limiter.limit("60/minute", key_func=get_company_id)
+@limiter.limit("5/minute", key_func=get_individual_id)
 async def analyze_image(
+    request: Request,
     file: UploadFile = File(...),
     auth = Depends(get_auth_user)
 ):
+    # file extension check
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unallowed file extension! Allowed extensions: {ALLOWED_EXTENSIONS}"
+        )
+    # mime type check
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="unallowed file mime type"
+        )
+    # file size check
+    if file.size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"file is too big: max size is {MAX_FILE_SIZE / (1024*1024)}MB"
+        )
+
     active_client_id = auth["id"]
 
+    # check credits
+    user_query = supabase.table("profiles").select("credits").eq("id", active_client_id).single().execute()
+    current_credits = user_query.data.get("credits", 0) if user_query.data else 0
+    if current_credits <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Not enough credits, please do payment"
+        )
+    
     try:
         content = await file.read()
         
@@ -143,9 +209,14 @@ async def analyze_image(
             }
             supabase.table("analysis_history").insert(db_data).execute()
 
+            # kredi düşme
+            new_credits = current_credits - 1
+            supabase.table("profiles").update({"credits": new_credits}).eq("id", active_client_id).execute()
+
             return {
                 "confidence_score": ai_score,
-                "request_id": result.get("request", {}).get("id")
+                "request_id": result.get("request", {}).get("id"),
+                "remaining_credits": new_credits
             }
         
         raise HTTPException(status_code=400, detail=f"API Error: {result}")
