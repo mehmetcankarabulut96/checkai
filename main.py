@@ -22,10 +22,15 @@ load_dotenv()
 
 app = FastAPI()
 
-# CORS / Cross Origine Resource Sharing
+origins = [
+    "http://localhost:3000",              # Yerel web geliştirme
+    "https://canli-app-ismi.vercel.app"  # Canlı web sitesi
+]
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # restrict only for web ip
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
