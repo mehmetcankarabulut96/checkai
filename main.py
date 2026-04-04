@@ -46,26 +46,48 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# b2b cradentials (Sadece X-API-KEY varsa dolu döner)
-def get_company_id(request: Request):
+def get_user_data(request: Request):
+    if hasattr(request.state, "user_id"):
+        return request.state.user_id, request.state.plan_type
+
+    user_id = None
+    plan_type = "free"
+
     api_key = request.headers.get("X-API-KEY")
     if api_key:
-        return f"key_{hashlib.md5(api_key.encode()).hexdigest()}"
-    return None # Bu limit atlanır
+        hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
+        res = supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
+        if res.data: user_id = res.data[0]["user_id"]
+    else:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            try:
+                payload = jwt.decode(auth_header.split(" ")[1], options={"verify_signature": False})
+                user_id = payload.get('sub')
+            except: pass
 
-# b2c cradentials (API Key yoksa çalışır)
-def get_individual_id(request: Request):
-    if request.headers.get("X-API-KEY"):
-        return None # Şirketse bu limiti atla
-    
-    auth_header = request.headers.get("Authorization")
-    if auth_header and auth_header.startswith("Bearer "):
-        try:
-            token = auth_header.split(" ")[1]
-            payload = jwt.decode(token, options={"verify_signature": False})
-            return f"user_{payload.get('sub')}"
-        except: pass
-    return get_remote_address(request)
+    if user_id:
+        profile = supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
+        if profile and profile.data:
+            plan_type = profile.data.get("plan_type", "free")
+    else:
+        user_id = get_remote_address(request)
+
+    request.state.user_id = user_id
+    request.state.plan_type = plan_type
+    return user_id, plan_type
+
+def get_free_id(request: Request):
+    uid, plan = get_user_data(request)
+    return uid if plan == "free" else None
+
+def get_pro_id(request: Request):
+    uid, plan = get_user_data(request)
+    return uid if plan == "pro" else None
+
+def get_business_id(request: Request):
+    uid, plan = get_user_data(request)
+    return uid if plan == "business" else None
 
 # get_remote_address -> Eğer özel bir fonksiyon belirtilmezse IP'ye göre limit koyar
 limiter = Limiter(key_func=get_remote_address)
@@ -85,15 +107,14 @@ async def get_auth_user(
     if api_key:
         hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
         result = supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
-        
         if result.data:
-            return {"id": result.data[0]["user_id"], "type": "company"}
+            return {"id": result.data[0]["user_id"]}
         
     # jwt
     if credentials:
         try:
             user_response = supabase.auth.get_user(credentials.credentials)
-            return {"id": user_response.user.id, "type": "individual"}
+            return {"id": user_response.user.id}
         except:
             pass
 
@@ -105,13 +126,13 @@ async def get_auth_user(
 async def generate_api_key(
     current_user = Depends(get_auth_user)
 ):
-    # check if user is a company
-    response = supabase.table("profiles").select("account_type").eq("id", current_user["id"]).maybe_single().execute()
+    # plan tipini kontrol et
+    response = supabase.table("profiles").select("plan_type").eq("id", current_user["id"]).maybe_single().execute()
 
-    if not response or not response.data or response.data.get("account_type") != "company":
+    if not response or not response.data or response.data.get("plan_type") not in ["pro", "business"]:
         raise HTTPException(
             status_code=403, 
-            detail="Only companies can generate API Key"
+            detail="Only pro and business users can generate API Keys."
         )
     
     # create random key
@@ -123,7 +144,7 @@ async def generate_api_key(
 
     try:
         db_data = {
-            "user_id": current_user.id,
+            "user_id": current_user["id"],
             "key_hash": key_hash,
             "key_hint": key_hint
         }
@@ -141,8 +162,9 @@ async def generate_api_key(
 
 # jwt + api
 @app.post("/analyze")
-@limiter.limit("60/minute", key_func=get_company_id)
-@limiter.limit("5/minute", key_func=get_individual_id)
+@limiter.limit("300/minute", key_func=get_business_id)
+@limiter.limit("60/minute", key_func=get_pro_id)
+@limiter.limit("2/minute", key_func=get_free_id)
 async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
