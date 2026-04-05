@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, jwt, os
+import httpx, hashlib, os, uuid, secrets, jwt
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
@@ -330,3 +330,9 @@ def login(user: UserLogin):
     except Exception as e:
         print(f"error details: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/me")
+async def get_me(auth = Depends(get_auth_user)):
+    user_id = auth["id"]
+    profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    return profile.data
