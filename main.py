@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, jwt
+import httpx, hashlib, os, uuid, secrets, jwt, hmac, json
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
@@ -336,3 +336,64 @@ async def get_me(auth = Depends(get_auth_user)):
     user_id = auth["id"]
     profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
     return profile.data
+
+#webhook
+@app.post("/webhook/lemonsqueezy", include_in_schema=False)
+async def lemon_squeezy_webhook(request: Request):
+    secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
+    signature = request.headers.get("X-Signature")
+    
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
+    body = await request.body()
+    
+    # Güvenlik Doğrulaması
+    hash_obj = hmac.new(secret, body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(hash_obj, signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    payload = json.loads(body)
+    event_name = payload.get("meta", {}).get("event_name")
+    custom_data = payload.get("meta", {}).get("custom_data", {})
+    user_id = custom_data.get("user_id")
+
+    if not user_id:
+        return {"status": "ignored", "reason": "user_id not found"}
+
+    attributes = payload.get("data", {}).get("attributes", {})
+    variant_id = str(attributes.get("variant_id"))
+
+    # lemon squeezy variants
+    PRO_VARIANT_ID = "1490323" 
+    BUSINESS_VARIANT_ID = "1490341"
+
+    try:
+        # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi direkt setler)
+        if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
+            plan_type = "free"
+            credits = 50
+            
+            if variant_id == PRO_VARIANT_ID:
+                plan_type = "pro"
+                credits = 5000
+            elif variant_id == BUSINESS_VARIANT_ID:
+                plan_type = "business"
+                credits = 25000
+                
+            supabase.table("profiles").update({
+                "plan_type": plan_type,
+                "credits": credits
+            }).eq("id", user_id).execute()
+            
+        # Abonelik süresi tamamen bittiğinde (Free plana düşürür)
+        elif event_name == 'subscription_expired':
+            supabase.table("profiles").update({
+                "plan_type": "free",
+                "credits": 50
+            }).eq("id", user_id).execute()
+
+        return {"status": "success"}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
