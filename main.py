@@ -81,6 +81,10 @@ def get_free_id(request: Request):
     uid, plan = get_user_data(request)
     return uid if plan == "free" else None
 
+def get_lite_id(request: Request):
+    uid, plan = get_user_data(request)
+    return uid if plan == "lite" else None
+
 def get_pro_id(request: Request):
     uid, plan = get_user_data(request)
     return uid if plan == "pro" else None
@@ -162,9 +166,10 @@ async def generate_api_key(
 
 # jwt + api
 @app.post("/analyze")
-@limiter.limit("300/minute", key_func=get_business_id)
+@limiter.limit("150/minute", key_func=get_business_id)
 @limiter.limit("60/minute", key_func=get_pro_id)
-@limiter.limit("2/minute", key_func=get_free_id)
+@limiter.limit("20/minute", key_func=get_lite_id)
+@limiter.limit("5/minute", key_func=get_free_id)
 async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
@@ -221,6 +226,23 @@ async def analyze_image(
         if result.get("status") == "success":
             ai_score = result.get("type", {}).get("ai_generated", 0)
             
+            # Değerlendirme Mantığı (Thresholds)
+            if ai_score < 0.40:
+                is_authentic = True
+                risk_level = "LOW"
+                label = "Authentic Content"
+                recommendation = "İçerik doğal görünüyor. Güvenli."
+            elif ai_score < 0.75:
+                is_authentic = False
+                risk_level = "MEDIUM"
+                label = "AI-Enhanced / Suspicious"
+                recommendation = "Yapay zeka müdahalesi tespit edildi. Manuel inceleme önerilir."
+            else:
+                is_authentic = False
+                risk_level = "HIGH"
+                label = "AI-Generated / Fraud"
+                recommendation = "Görsel tamamen sentetik. Paylaşımdan kaçının."
+
             # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
             file_extension = file.filename.split(".")[-1]
             unique_filename = f"{uuid.uuid4()}.{file_extension}"
@@ -232,7 +254,9 @@ async def analyze_image(
             db_data = {
                 "user_id": active_client_id,
                 "image_url": image_url,
-                "confidence_score": ai_score
+                "confidence_score": ai_score,
+                "risk_level": risk_level,
+                "label": label
             }
             supabase.table("analysis_history").insert(db_data).execute()
 
@@ -241,9 +265,13 @@ async def analyze_image(
             supabase.table("profiles").update({"credits": new_credits}).eq("id", active_client_id).execute()
 
             return {
-                "confidence_score": ai_score,
-                "request_id": result.get("request", {}).get("id"),
-                "remaining_credits": new_credits
+                "scan_id": result.get("request", {}).get("id", str(uuid.uuid4())),
+                "is_authentic": is_authentic,
+                "risk_level": risk_level,
+                "ai_score": ai_score,
+                "label": label,
+                "recommendation": recommendation,
+                "credits_left": new_credits
             }
         
         raise HTTPException(status_code=400, detail=f"API Error: {result}")
@@ -365,6 +393,7 @@ async def lemon_squeezy_webhook(request: Request):
     variant_id = str(attributes.get("variant_id"))
 
     # lemon squeezy variants
+    LITE_VARIANT_ID = "1490345"
     PRO_VARIANT_ID = "1490323" 
     BUSINESS_VARIANT_ID = "1490341"
 
@@ -372,14 +401,17 @@ async def lemon_squeezy_webhook(request: Request):
         # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi direkt setler)
         if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
             plan_type = "free"
-            credits = 50
+            credits = 25
             
-            if variant_id == PRO_VARIANT_ID:
+            if variant_id == LITE_VARIANT_ID:
+                plan_type = "lite"
+                credits = 200
+            elif variant_id == PRO_VARIANT_ID:
                 plan_type = "pro"
-                credits = 5000
+                credits = 1000
             elif variant_id == BUSINESS_VARIANT_ID:
                 plan_type = "business"
-                credits = 25000
+                credits = 3000
                 
             supabase.table("profiles").update({
                 "plan_type": plan_type,
@@ -390,7 +422,7 @@ async def lemon_squeezy_webhook(request: Request):
         elif event_name == 'subscription_expired':
             supabase.table("profiles").update({
                 "plan_type": "free",
-                "credits": 50
+                "credits": 25
             }).eq("id", user_id).execute()
 
         return {"status": "success"}
