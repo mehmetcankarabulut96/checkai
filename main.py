@@ -258,11 +258,18 @@ async def analyze_image(
                 "risk_level": risk_level,
                 "label": label
             }
-            supabase.table("analysis_history").insert(db_data).execute()
+            db_insert_response = supabase.table("analysis_history").insert(db_data).execute()
+            history_id = db_insert_response.data[0]['id']
 
-            # kredi düşme
-            new_credits = current_credits - 1
-            supabase.table("profiles").update({"credits": new_credits}).eq("id", active_client_id).execute()
+            # güvenli kredi düşme ve rollback (rpc)
+            try:
+                rpc_response = supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
+                new_credits = rpc_response.data
+            except Exception as db_err:
+                # Kredi düşme başarısız olursa işlemleri geri al (Rollback)
+                supabase.table("analysis_history").delete().eq("id", history_id).execute()
+                supabase.storage.from_("images").remove([file_path])
+                raise HTTPException(status_code=402, detail="Kredi düşülemedi, işlem iptal edildi.")
 
             return {
                 "scan_id": result.get("request", {}).get("id", str(uuid.uuid4())),
