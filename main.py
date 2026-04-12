@@ -65,7 +65,7 @@ async def get_auth_user(
             pass
 
     # unauthorized
-    raise HTTPException(status_code=401, detail={"error_code": "UNAUTHORIZED", "message": "Geçerli API Key gerekli."})
+    raise HTTPException(status_code=401, detail={"error_code": "UNAUTHORIZED", "message": "unauthorized."})
 
 def get_user_data(request: Request):
     if hasattr(request.state, "user_id"):
