@@ -159,30 +159,35 @@ ANALYSIS_MAP = {
         "label": "DEEPFAKE_DETECTION",
         "description": "Görsel üzerinde yüz nakli veya manipülasyonu tespit edildi.",
         "risk_level": "HIGH",
+        "action": "REJECT",
         "recommendation": "İşlemi durdurun ve kullanıcıyı manuel incelemeye alın."
     },
     "SYNTHETIC": {
         "label": "SYNTHETIC_CONTENT",
         "description": "Görsel tamamen yapay zeka tarafından üretilmiştir.",
         "risk_level": "HIGH",
+        "action": "REJECT",
         "recommendation": "Bot profili olma ihtimali çok yüksek. Erişimi kısıtlayın."
     },
     "MODIFIED": {
         "label": "MODIFIED_CONTENT",
         "description": "Görselde ağır filtre veya dijital rötuş tespit edildi.",
         "risk_level": "MEDIUM",
+        "action": "REVIEW",
         "recommendation": "Gerçeklikten sapma var. Ek doğrulama istenebilir."
     },
     "INCONCLUSIVE": {
         "label": "INCONCLUSIVE",
         "description": "Düşük kalite veya ekran görüntüsü nedeniyle analiz belirsiz.",
         "risk_level": "MEDIUM",
+        "action": "REVIEW",
         "recommendation": "Lütfen kullanıcınızdan orijinal ve anlık bir fotoğraf isteyin."
     },
     "AUTHENTIC": {
         "label": "AUTHENTIC",
         "description": "Görsel doğal ve müdahalesiz görünüyor.",
         "risk_level": "LOW",
+        "action": "ACCEPT",
         "recommendation": "Güvenli. İşleme devam edebilirsiniz."
     }
 }
@@ -277,7 +282,10 @@ async def analyze_image(
                 "genai_score": genai_score,
                 "deepfake_score": deepfake_score,
                 "risk_level": decision["risk_level"],
-                "label": decision["label"]
+                "label": decision["label"],
+                "action": decision["action"],
+                "user_request_id": request_id,
+                "provider_request_id": result.get("request", {}).get("id")
             }
             db_insert_response = supabase.table("analysis_history").insert(db_data).execute()
             history_id = db_insert_response.data[0]['id']
@@ -300,6 +308,7 @@ async def analyze_image(
                     "label": decision["label"],
                     "description": decision["description"],
                     "risk_level": decision["risk_level"],
+                    "action": decision["action"],
                     "recommendation": decision["recommendation"],
                     "confidence_scores": {
                         "synthetic_probability": genai_score,
