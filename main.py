@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, jwt, hmac, json, time
+import httpx, hashlib, os, uuid, secrets, jwt, hmac, json, time, cv2, numpy as np, mediapipe as mp
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
@@ -12,6 +12,8 @@ from starlette.requests import Request
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 # security
 MIN_FILE_SIZE = 50 * 1024 # 50 KB (trash)
@@ -43,6 +45,52 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # authentication (b2b priority)
 security = HTTPBearer(auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
+
+# tflite modeli yolu
+MODEL_PATH = 'blaze_face_short_range.tflite'
+
+# start the model globally
+try:
+    base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceDetectorOptions(
+        base_options=base_options, 
+        min_detection_confidence=0.5
+    )
+    face_detector = vision.FaceDetector.create_from_options(options)
+except Exception as e:
+    print(f"tflite model could not be loaded, details: {e}")
+
+async def has_human_face(image_bytes: bytes) -> bool:
+    """
+    Byte olarak gelen görselde insan yüzü olup olmadığını kontrol eder.
+    (Yeni MediaPipe Tasks API mimarisi kullanılmıştır)
+    """
+    try:
+        # 1. Byte verisini Numpy dizisine çevir
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if img is None:
+            return False
+            
+        # 2. Resmi BGR'den RGB'ye çevir (MediaPipe sadece RGB anlar)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # 3. OpenCV matrisini, yeni MediaPipe Image objesine dönüştür
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        
+        # 4. Yüz tespitini tetikle
+        detection_result = face_detector.detect(mp_image)
+        
+        # 5. Sonuçlarda yüz var mı kontrol et
+        if len(detection_result.detections) > 0:
+            return True
+            
+        return False
+        
+    except Exception as e:
+        print(f"Yüz tespiti sırasında hata: {str(e)}")
+        return False
 
 # jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir
 async def get_auth_user(
@@ -121,17 +169,30 @@ async def generate_api_key(
 ):
     # plan tipini kontrol et
     response = supabase.table("profiles").select("plan_type").eq("id", current_user["id"]).maybe_single().execute()
+    plan_type = response.data.get("plan_type", "free") if response and response.data else "free"
 
-    if not response or not response.data or response.data.get("plan_type") not in ["pro", "business"]:
+    # define max key count of plans
+    PLAN_LIMITS = {
+        "free": 1,
+        "lite": 2,
+        "pro": 5,
+        "business": float('inf') # infinity for enterprises
+    }
+    max_keys = PLAN_LIMITS.get(plan_type, 1)
+
+    # check key count of user
+    keys_query = supabase.table("api_keys").select("id", count="exact").eq("user_id", current_user["id"]).execute()
+    current_key_count = keys_query.count if keys_query.count is not None else 0
+
+    # check limit
+    if current_key_count >= max_keys:
         raise HTTPException(
             status_code=403, 
-            detail="Only pro and business users can generate API Keys."
+            detail=f"API Key limit reached for {plan_type} plan. Maximum allowed: {max_keys}. Please delete an existing key to create a new one."
         )
     
     # create random key
     raw_key = f"sk_live_{secrets.token_urlsafe(32)}"
-
-    # hash the key and create hint
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
     key_hint = f"{raw_key[:8]}...{raw_key[-4:]}"
 
@@ -251,90 +312,99 @@ async def analyze_image(
     try:
         content = await file.read()
         
-        params = {
-            'models': 'genai,deepfake',
-            'api_user': SIGHTENGINE_USER,
-            'api_secret': SIGHTENGINE_SECRET
-        }
-        
-        files = {'media': (file.filename, content, file.content_type)}
+        # humna face check
+        is_human = await has_human_face(content)
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(API_URL, data=params, files=files)
-            # Hata kodu dönerse (4xx, 5xx) direkt yakalamak için:
-            response.raise_for_status() 
-            result = response.json()
+        if not is_human:
+            # Yüz yoksa API'ye gitme, sıfır değerleri ata
+            decision = ANALYSIS_MAP["NO_HUMAN_FACE"]
+            genai_score = 0.0
+            deepfake_score = 0.0
+            provider_req_id = None
+        else:
+            # Yüz varsa Sightengine analizini yap
+            params = {
+                'models': 'genai,deepfake',
+                'api_user': SIGHTENGINE_USER,
+                'api_secret': SIGHTENGINE_SECRET
+            }
+            files = {'media': (file.filename, content, file.content_type)}
 
-        if result.get("status") == "success":
+            async with httpx.AsyncClient() as client:
+                response = await client.post(API_URL, data=params, files=files)
+                response.raise_for_status() 
+                result = response.json()
+
+            if result.get("status") != "success":
+                raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
+
             genai_score = result.get("type", {}).get("ai_generated", 0)
             deepfake_score = result.get("type", {}).get("deepfake", 0)
-            
+            provider_req_id = result.get("request", {}).get("id")
+
             # decision
-            if deepfake_score >= 0.8: decision = ANALYSIS_MAP["DEEPFAKE"]
+            if deepfake_score >= 0.80: decision = ANALYSIS_MAP["DEEPFAKE"]
             elif genai_score >= 0.85: decision = ANALYSIS_MAP["SYNTHETIC"]
-            elif 0.2 < deepfake_score < 0.8 or 0.3 < genai_score < 0.85: decision = ANALYSIS_MAP["INCONCLUSIVE"]
-            elif genai_score >= 0.4: decision = ANALYSIS_MAP["MODIFIED"]
+            elif 0.50 <= genai_score < 0.85: decision = ANALYSIS_MAP["MODIFIED"]
+            elif 0.30 <= deepfake_score < 0.80 or 0.30 <= genai_score < 0.50: decision = ANALYSIS_MAP["INCONCLUSIVE"]
             else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
-            # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
-            file_extension = file.filename.split(".")[-1]
-            unique_filename = f"{uuid.uuid4()}.{file_extension}"
-            file_path = f"{active_client_id}/{unique_filename}"
-            supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
-            image_url = supabase.storage.from_("images").get_public_url(file_path)
+        # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
+        file_extension = file.filename.split(".")[-1]
+        unique_filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = f"{active_client_id}/{unique_filename}"
+        supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
+        image_url = supabase.storage.from_("images").get_public_url(file_path)
 
-            # DB'ye kaydet
-            db_data = {
-                "user_id": active_client_id,
-                "image_url": image_url,
-                "genai_score": genai_score,
-                "deepfake_score": deepfake_score,
-                "risk_level": decision["risk_level"],
-                "label": decision["label"],
-                "action": decision["action"],
-                "user_request_id": request_id,
-                "provider_request_id": result.get("request", {}).get("id")
-            }
-            db_insert_response = supabase.table("analysis_history").insert(db_data).execute()
-            history_id = db_insert_response.data[0]['id']
+        # DB'ye kaydet
+        db_data = {
+            "user_id": active_client_id,
+            "image_url": image_url,
+            "genai_score": genai_score,
+            "deepfake_score": deepfake_score,
+            "risk_level": decision["risk_level"],
+            "label": decision["label"],
+            "action": decision["action"],
+            "user_request_id": request_id,
+            "provider_request_id": provider_req_id
+        }
+        db_insert_response = supabase.table("analysis_history").insert(db_data).execute()
+        history_id = db_insert_response.data[0]['id']
 
-            # güvenli kredi düşme ve rollback (rpc)
-            try:
-                rpc_response = supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
-                new_credits = rpc_response.data
-            except Exception as db_err:
-                # Kredi düşme başarısız olursa işlemleri geri al (Rollback)
-                supabase.table("analysis_history").delete().eq("id", history_id).execute()
-                try: supabase.storage.from_("images").remove([file_path])
-                except: pass
-                raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi, işlem iptal edildi."})
-
-            return {
-                "request_id": request_id,
-                "status": "success",
-                "results": {
-                    "verdict": {
-                        "action": decision["action"],
-                        "risk_level": decision["risk_level"],
-                        "label": decision["label"]
-                    },
-                    "summary": {
-                        "description": decision["description"],
-                        "recommendation": decision["recommendation"]
-                    },
-                    "scores": {
-                        "ai_generated": genai_score,
-                        "deepfake": deepfake_score
-                    }
-                },
-                "meta": {
-                    "credits_remaining": new_credits,
-                    "processing_time_ms": int((time.time() - start_time) * 1000)
-                }
-            }
+        # güvenli kredi düşme ve rollback (rpc)
+        try:
+            rpc_response = supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
+            new_credits = rpc_response.data
+        except Exception as db_err:
+            # Kredi düşme başarısız olursa işlemleri geri al (Rollback)
+            supabase.table("analysis_history").delete().eq("id", history_id).execute()
+            try: supabase.storage.from_("images").remove([file_path])
+            except: pass
+            raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi, işlem iptal edildi."})
         
-        raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
-
+        return {
+            "request_id": request_id,
+            "status": "success",
+            "results": {
+                "verdict": {
+                    "action": decision["action"],
+                    "risk_level": decision["risk_level"],
+                    "label": decision["label"]
+                },
+                "summary": {
+                    "description": decision["description"],
+                    "recommendation": decision["recommendation"]
+                },
+                "scores": {
+                    "ai_generated": genai_score,
+                    "deepfake": deepfake_score
+                }
+            },
+            "meta": {
+                "credits_remaining": new_credits,
+                "processing_time_ms": int((time.time() - start_time) * 1000)
+            }
+        }
     except Exception as e:
         print(f"error details: {e}")
         raise HTTPException(status_code=500, detail={"request_id": request_id, "error": str(e)})
@@ -460,17 +530,18 @@ async def lemon_squeezy_webhook(request: Request):
         # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi direkt setler)
         if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
             plan_type = "free"
-            credits = 25
+            credits = 50
             
             if variant_id == LITE_VARIANT_ID:
                 plan_type = "lite"
-                credits = 200
+                credits = 500
             elif variant_id == PRO_VARIANT_ID:
                 plan_type = "pro"
-                credits = 1000
+                credits = 2000
             elif variant_id == BUSINESS_VARIANT_ID:
                 plan_type = "business"
-                credits = 3000
+                # custom_data içinden anlaştığın limiti çek, gelmezse fallback olarak 5000 ata
+                credits = int(custom_data.get("custom_credits", 5000))
                 
             supabase.table("profiles").update({
                 "plan_type": plan_type,
@@ -481,7 +552,7 @@ async def lemon_squeezy_webhook(request: Request):
         elif event_name == 'subscription_expired':
             supabase.table("profiles").update({
                 "plan_type": "free",
-                "credits": 25
+                "credits": 50
             }).eq("id", user_id).execute()
 
         return {"status": "success"}
