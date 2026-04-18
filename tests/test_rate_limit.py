@@ -3,8 +3,8 @@ import asyncio, httpx, time, os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_IMAGE_PATH = os.path.join(BASE_DIR, "test_photo.jpg")
 
-API_KEY = "sk_live_0W-4SQQ-3RmkjS3tBk2kYlxqID6_AEn0mHtP2IgnDM4"
-URL = "http://localhost:8000/v1/analyze"
+API_KEY = "sk_live_PD4gZzEynGw0YxypG67t3ik8QrYtvPllMJinSr0qwbk"
+URL = "https://checkai-6id9.onrender.com/v1/analyze"
 
 async def send_request(client, req_id):
     headers = {"X-API-KEY": API_KEY}
