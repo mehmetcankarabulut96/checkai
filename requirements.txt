@@ -1,3 +1,4 @@
+pydantic[email]
 python-multipart==0.0.9
 absl-py==2.4.0
 annotated-doc==0.0.4
