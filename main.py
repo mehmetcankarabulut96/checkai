@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, jwt, hmac, json, time, cv2, numpy as np, mediapipe as mp
+import httpx, hashlib, os, uuid, secrets, jwt, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
@@ -9,9 +9,6 @@ from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from starlette.requests import Request
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -21,15 +18,20 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
-load_dotenv()
+# rate limiting
+RATE_LIMIT_STORAGE = {} # Rate limit için in-memory storage (MVP için yeterli)
+RATE_LIMIT_LOCK = asyncio.Lock()
+PACKAGE_LIMITS = { # rate limit for packages
+    "free": 1,
+    "lite": 1,
+    "pro": 1
+}
 
 app = FastAPI(title="checkai b2b api", version="1.0.0")
 
-# limiter & cors
-# get_remote_address -> Eğer özel bir fonksiyon belirtilmezse IP'ye göre limit koyar
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+load_dotenv()
+
+# cors
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # Sightengine cradentials
@@ -45,6 +47,13 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # authentication (b2b priority)
 security = HTTPBearer(auto_error=False)
 api_key_header = APIKeyHeader(name="X-API-KEY", auto_error=False)
+
+# global http client
+http_client = httpx.AsyncClient(
+    http2=False, # Kararlılık için HTTP/1.1
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    timeout=httpx.Timeout(10.0)
+)
 
 # tflite modeli yolu
 MODEL_PATH = 'blaze_face_short_range.tflite'
@@ -100,14 +109,19 @@ async def get_auth_user(
     # x-api-key
     if api_key:
         hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
-        result = supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
+        # supabase sorgusunu ayrı bir thread ile yapıyoruz, böylece saniye bazlı rate limit uygulayabiliriz
+        result = await asyncio.to_thread(
+            lambda: supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
+        )
         if result.data:
             return {"id": result.data[0]["user_id"]}
         
     # jwt
     if credentials:
         try:
-            user_response = supabase.auth.get_user(credentials.credentials)
+            user_response = await asyncio.to_thread(
+                lambda: supabase.auth.get_user(credentials.credentials)
+            )
             return {"id": user_response.user.id}
         except:
             pass
@@ -115,60 +129,53 @@ async def get_auth_user(
     # unauthorized
     raise HTTPException(status_code=401, detail={"error_code": "UNAUTHORIZED", "message": "unauthorized."})
 
-def get_user_data(request: Request):
-    if hasattr(request.state, "user_id"):
-        return request.state.user_id, request.state.plan_type
+async def rate_limiter(auth = Depends(get_auth_user)):
+    user_id = auth["id"]
 
-    user_id = None
-    plan_type = "free"
-
-    api_key = request.headers.get("X-API-KEY")
-    if api_key:
-        hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
-        res = supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
-        if res.data: user_id = res.data[0]["user_id"]
+    # Kullanıcının planını ve (varsa) özel limitini DB'den al
+    profile_res = await asyncio.to_thread(
+        lambda: supabase.table("profiles").select("plan_type, custom_rate_limit").eq("id", user_id).maybe_single().execute()
+    )
+    profile = profile_res.data or {}
+    
+    plan_type = profile.get("plan_type", "free")
+    
+    # 1. Limit Belirleme
+    if plan_type == "business":
+        limit = profile.get("custom_rate_limit") or 5 # DB'de yoksa varsayılan 5
     else:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            try:
-                payload = jwt.decode(auth_header.split(" ")[1], options={"verify_signature": False})
-                user_id = payload.get('sub')
-            except: pass
+        limit = PACKAGE_LIMITS.get(plan_type, 1)
 
-    if user_id:
-        profile = supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
-        if profile and profile.data:
-            plan_type = profile.data.get("plan_type", "free")
-    else:
-        user_id = get_remote_address(request)
+    # 2. Limit Kontrolü (1 Saniyelik Pencere)
+    async with RATE_LIMIT_LOCK:
+        now = time.time()
 
-    request.state.user_id = user_id
-    request.state.plan_type = plan_type
-    return user_id, plan_type
+        if user_id not in RATE_LIMIT_STORAGE:
+            RATE_LIMIT_STORAGE[user_id] = []
+        
+        # Sadece son 1 saniye içindeki istekleri bellekte tut
+        RATE_LIMIT_STORAGE[user_id] = [t for t in RATE_LIMIT_STORAGE[user_id] if now - t < 1.0]
+        
+        if len(RATE_LIMIT_STORAGE[user_id]) >= limit:
+            raise HTTPException(
+                status_code=429, 
+                detail=f"Rate limit exceeded. Your {plan_type} plan allows {limit} requests per second."
+            )
+            
+        RATE_LIMIT_STORAGE[user_id].append(now)
 
-def get_free_id(request: Request):
-    uid, plan = get_user_data(request)
-    return uid if plan == "free" else None
-
-def get_lite_id(request: Request):
-    uid, plan = get_user_data(request)
-    return uid if plan == "lite" else None
-
-def get_pro_id(request: Request):
-    uid, plan = get_user_data(request)
-    return uid if plan == "pro" else None
-
-def get_business_id(request: Request):
-    uid, plan = get_user_data(request)
-    return uid if plan == "business" else None
+    # Endpoint'in kullanması için auth datayı geri dön
+    return auth
 
 # jwt
 @app.post("/generate-api-key")
 async def generate_api_key(
-    current_user = Depends(get_auth_user)
+    current_user = Depends(rate_limiter)
 ):
     # plan tipini kontrol et
-    response = supabase.table("profiles").select("plan_type").eq("id", current_user["id"]).maybe_single().execute()
+    response = await asyncio.to_thread(
+        lambda: supabase.table("profiles").select("plan_type").eq("id", current_user["id"]).maybe_single().execute()
+    )
     plan_type = response.data.get("plan_type", "free") if response and response.data else "free"
 
     # define max key count of plans
@@ -181,7 +188,9 @@ async def generate_api_key(
     max_keys = PLAN_LIMITS.get(plan_type, 1)
 
     # check key count of user
-    keys_query = supabase.table("api_keys").select("id", count="exact").eq("user_id", current_user["id"]).execute()
+    keys_query = await asyncio.to_thread(
+        lambda: supabase.table("api_keys").select("id", count="exact").eq("user_id", current_user["id"]).execute()
+    )
     current_key_count = keys_query.count if keys_query.count is not None else 0
 
     # check limit
@@ -202,7 +211,9 @@ async def generate_api_key(
             "key_hash": key_hash,
             "key_hint": key_hint
         }
-        supabase.table("api_keys").insert(db_data).execute()
+        await asyncio.to_thread(
+            lambda: supabase.table("api_keys").insert(db_data).execute()
+        )
 
         # raw_key only accessed from here
         return {
@@ -262,17 +273,13 @@ ANALYSIS_MAP = {
 
 # jwt + api
 @app.post("/v1/analyze")
-@limiter.limit("150/minute", key_func=get_business_id)
-@limiter.limit("60/minute", key_func=get_pro_id)
-@limiter.limit("20/minute", key_func=get_lite_id)
-@limiter.limit("5/minute", key_func=get_free_id)
 async def analyze_image(
     request: Request,
     file: UploadFile = File(...),
-    auth = Depends(get_auth_user)
+    auth = Depends(rate_limiter)
 ):
-    request_id = f"req_{uuid.uuid4().hex[:12]}"
     active_client_id = auth["id"]
+    request_id = f"req_{uuid.uuid4().hex[:12]}"
     start_time = time.time()
 
     # file extension check
@@ -301,7 +308,9 @@ async def analyze_image(
         )
 
     # check credits
-    user_query = supabase.table("profiles").select("credits").eq("id", active_client_id).single().execute()
+    user_query = await asyncio.to_thread(
+        lambda: supabase.table("profiles").select("credits").eq("id", active_client_id).single().execute()
+    )
     current_credits = user_query.data.get("credits", 0) if user_query.data else 0
     if current_credits <= 0:
         raise HTTPException(
@@ -330,10 +339,9 @@ async def analyze_image(
             }
             files = {'media': (file.filename, content, file.content_type)}
 
-            async with httpx.AsyncClient() as client:
-                response = await client.post(API_URL, data=params, files=files)
-                response.raise_for_status() 
-                result = response.json()
+            response = await http_client.post(API_URL, data=params, files=files)
+            response.raise_for_status() 
+            result = response.json()
 
             if result.get("status") != "success":
                 raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
@@ -368,16 +376,22 @@ async def analyze_image(
             "user_request_id": request_id,
             "provider_request_id": provider_req_id
         }
-        db_insert_response = supabase.table("analysis_history").insert(db_data).execute()
+        db_insert_response = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history").insert(db_data).execute()
+        )
         history_id = db_insert_response.data[0]['id']
 
         # güvenli kredi düşme ve rollback (rpc)
         try:
-            rpc_response = supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
+            rpc_response = await asyncio.to_thread(
+                lambda: supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
+            )
             new_credits = rpc_response.data
         except Exception as db_err:
             # Kredi düşme başarısız olursa işlemleri geri al (Rollback)
-            supabase.table("analysis_history").delete().eq("id", history_id).execute()
+            await asyncio.to_thread(
+                lambda: supabase.table("analysis_history").delete().eq("id", history_id).execute()
+            )
             try: supabase.storage.from_("images").remove([file_path])
             except: pass
             raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi, işlem iptal edildi."})
@@ -412,19 +426,20 @@ async def analyze_image(
 # jwt + api
 @app.get("/history")
 async def get_history(
-    auth = Depends(get_auth_user)
+    auth = Depends(rate_limiter)
 ):
     # Kim gelirse gelsin user_id'sini al
     active_client_id = auth["id"]
 
     try:
         # Sadece giriş yapan kullanıcıya ait verileri çek
-        response = supabase.table("analysis_history") \
-            .select("*") \
-            .eq("user_id", active_client_id) \
-            .order("created_at", desc=True) \
-            .execute()
-        
+        response = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history") \
+                .select("*") \
+                .eq("user_id", active_client_id) \
+                .order("created_at", desc=True) \
+                .execute()
+        )
         return response.data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
@@ -466,8 +481,6 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-# bu endpointi arayüz üzerinden giriş yapacak bireysel kullanıcılar ve şirket yetkilileri(admin paneli) kullanır
-# b2b uygulamalar login olmadan access-token ile istek yaparlar
 @app.post("/login")
 def login(user: UserLogin):
     try:
@@ -489,9 +502,11 @@ def login(user: UserLogin):
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/me")
-async def get_me(auth = Depends(get_auth_user)):
+async def get_me(auth = Depends(rate_limiter)):
     user_id = auth["id"]
-    profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    profile = await asyncio.to_thread(
+        lambda: supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+    )
     return profile.data
 
 #webhook
@@ -543,17 +558,15 @@ async def lemon_squeezy_webhook(request: Request):
                 # custom_data içinden anlaştığın limiti çek, gelmezse fallback olarak 5000 ata
                 credits = int(custom_data.get("custom_credits", 5000))
                 
-            supabase.table("profiles").update({
-                "plan_type": plan_type,
-                "credits": credits
-            }).eq("id", user_id).execute()
+            await asyncio.to_thread(
+                lambda: supabase.table("profiles").update({"plan_type": plan_type,"credits": credits}).eq("id", user_id).execute()
+            )
             
         # Abonelik süresi tamamen bittiğinde (Free plana düşürür)
         elif event_name == 'subscription_expired':
-            supabase.table("profiles").update({
-                "plan_type": "free",
-                "credits": 50
-            }).eq("id", user_id).execute()
+            await asyncio.to_thread(
+                lambda: supabase.table("profiles").update({"plan_type": "free","credits": 50}).eq("id", user_id).execute()
+            )
 
         return {"status": "success"}
     
