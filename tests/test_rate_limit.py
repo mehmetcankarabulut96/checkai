@@ -34,7 +34,7 @@ async def main():
     print(f"{request_count} requests sending concurrently...")
     start_time = time.time()
     
-    async with httpx.AsyncClient(timeout=10.0, http2=False) as client:
+    async with httpx.AsyncClient(timeout=20.0, http2=False) as client:
         # create tasks: every request will send at the same time
         tasks = []
         for i in range(1, request_count + 1):
