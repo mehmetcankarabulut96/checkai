@@ -1,31 +1,26 @@
-FROM ubuntu:22.04
+# Kararlı Python 3.11 tabanı
+FROM python:3.11-slim
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
-
-# Gerekli sistem araçlarını ve derleyicileri kur
+# MediaPipe ve OpenCV için hayati önem taşıyan sistem kütüphaneleri
+# Bu katman, "libGLESv2.so.2 not found" hatasını kalıcı olarak çözer
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3-pip \
-    python3.11-dev \
-    build-essential \
-    pkg-config \
     libgl1-mesa-glx \
     libgles2 \
     libegl1-mesa \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Çalışma dizini
 WORKDIR /app
 
-# Pip güncelleme
-RUN python3 -m pip install --upgrade pip setuptools wheel
-
+# Önce bağımlılıkları kopyalayıp kuruyoruz (Docker önbelleği için)
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Önemli: Eğer requirements'da takılırsa zorlamayı bırakıp kurması için
-RUN python3 -m pip install --no-cache-dir -r requirements.txt
-
+# Kaynak kodun tamamını kopyala
 COPY . .
 
-CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Render varsayılan portu 10000'dir. Uygulamayı uvicorn ile başlatıyoruz.
+# Workers sayısını 1 tutmak MediaPipe'ın bellek kullanımı için daha güvenlidir.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1"]
