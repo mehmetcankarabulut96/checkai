@@ -3,8 +3,9 @@ import asyncio, httpx, time, os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEST_IMAGE_PATH = os.path.join(BASE_DIR, "test_photo.jpg")
 
-API_KEY = "sk_live_PD4gZzEynGw0YxypG67t3ik8QrYtvPllMJinSr0qwbk"
-URL = "https://checkai-6id9.onrender.com/v1/analyze"
+API_KEY = "sk_live_0W-4SQQ-3RmkjS3tBk2kYlxqID6_AEn0mHtP2IgnDM4"
+URL_LIVE = "https://checkai-6id9.onrender.com/v1/analyze"
+URL_LOCAL = "http://localhost:8000/v1/analyze"
 
 async def send_request(client, req_id):
     headers = {"X-API-KEY": API_KEY}
@@ -15,7 +16,7 @@ async def send_request(client, req_id):
             files = {"file": ("test_photo.jpg", f, "image/jpeg")}
             
             # exponential backoff (yeniden deneme) mantığı eklenebilir
-            response = await client.post(URL, headers=headers, files=files)
+            response = await client.post(URL_LOCAL, headers=headers, files=files)
             
             if response.status_code == 200:
                 print(f"✅ [{req_id}] success: {response.json()['request_id']}")
@@ -28,7 +29,7 @@ async def send_request(client, req_id):
 
 async def main():
     # concurrent request count
-    request_count = 5
+    request_count = 10
     
     print(f"{request_count} requests sending concurrently...")
     start_time = time.time()

@@ -1,8 +1,8 @@
 
-import httpx, hashlib, os, uuid, secrets, jwt, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Security, status
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
@@ -71,35 +71,38 @@ except Exception as e:
 
 async def has_human_face(image_bytes: bytes) -> bool:
     """
-    Byte olarak gelen görselde insan yüzü olup olmadığını kontrol eder.
-    (Yeni MediaPipe Tasks API mimarisi kullanılmıştır)
+        Numpy 2.0+ ve en güncel MediaPipe sürümleriyle uyumlu, 
+        'image_ptr' hatasını engelleyen modern implementasyon.
     """
     try:
-        # 1. Byte verisini Numpy dizisine çevir
-        nparr = np.frombuffer(image_bytes, np.uint8)
+        # byte verisini Numpy dizisine çevir
+        # .copy() eklenmezse MediaPipe '_image_ptr' hatası fırlatır.
+        nparr = np.frombuffer(image_bytes, np.uint8).copy()
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
             return False
             
-        # 2. Resmi BGR'den RGB'ye çevir (MediaPipe sadece RGB anlar)
+        # MediaPipe RGB formatı bekler
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # 3. OpenCV matrisini, yeni MediaPipe Image objesine dönüştür
+        # KRİTİK ADIM: Numpy dizisinin hafıza düzenini (memory layout) zorla düzeltiyoruz
+        # Bu satır, MediaPipe'ın beklediği C-style hafıza dizilimini garanti eder.
+        img_rgb = np.ascontiguousarray(img_rgb)
+
+        # MediaPipe Image objesini oluştur
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
         
-        # 4. Yüz tespitini tetikle
-        detection_result = face_detector.detect(mp_image)
-        
-        # 5. Sonuçlarda yüz var mı kontrol et
+        # CPU bloklanmasını önlemek için asenkron thread kullan
+        detection_result = await asyncio.to_thread(face_detector.detect, mp_image)
+    
+        # Sonuçlarda yüz var mı kontrol et
         if len(detection_result.detections) > 0:
             return True
-            
         return False
         
     except Exception as e:
-        print(f"Yüz tespiti sırasında hata: {str(e)}")
-        return False
+        print(f"Face detection engine failed: {str(e)}")
+        raise RuntimeError("Face detection engine failed") from e
 
 # jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir
 async def get_auth_user(
@@ -321,8 +324,13 @@ async def analyze_image(
     try:
         content = await file.read()
         
-        # humna face check
-        is_human = await has_human_face(content)
+        try:
+            is_human = await has_human_face(content)
+        except Exception as face_err:
+            raise HTTPException(
+                status_code=500, 
+                detail={"error": "Face detection service temporarily unavailable. No credits deducted."}
+            )
 
         if not is_human:
             # Yüz yoksa API'ye gitme, sıfır değerleri ata
