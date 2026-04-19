@@ -51,11 +51,19 @@ DAILY_LIMITS = {
     "lite": 75,
     "pro": 300
 }
+# live key limits
+PLAN_KEY_LIMITS = {
+    "free": 1,
+    "lite": 2,
+    "pro": 5
+}
+
 # business package default limits, theese used if data not fount at database
 DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_SECOND = 5
 DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_MINUTE = 120
 DEFAULT_BUSINESS_PACKAGE_DAILY_CREDITS_LIMIT = 500
 DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT = 5000
+DEFAULT_BUSINESS_PACKAGE_MAX_LIVE_KEY_LIMIT = 20
 
 app = FastAPI(title="checkai b2b api", version="1.0.0")
 
@@ -134,7 +142,8 @@ async def has_human_face(image_bytes: bytes) -> bool:
         logger.error("Face detection engine failed", exc_info=True)
         raise RuntimeError("Face detection engine failed") from e
 
-# jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir
+# jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir.
+# test keyi de tespit eder
 async def get_auth_user(
     api_key: str = Depends(api_key_header),
     credentials: HTTPAuthorizationCredentials = Depends(security)
@@ -147,7 +156,7 @@ async def get_auth_user(
             lambda: supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
         )
         if result.data:
-            return {"id": result.data[0]["user_id"]}
+            return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
         
     # jwt
     if credentials:
@@ -155,7 +164,7 @@ async def get_auth_user(
             user_response = await asyncio.to_thread(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
-            return {"id": user_response.user.id}
+            return {"id": user_response.user.id, "is_test": False}
         except:
             pass
 
@@ -255,56 +264,61 @@ async def check_daily_limit(user_id: str, plan_type: str):
 # jwt
 @app.post("/generate-api-key")
 async def generate_api_key(
+    key_type: str = "live",
     current_user = Depends(rate_limiter)
 ):
-    # plan tipini kontrol et
-    response = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("plan_type").eq("id", current_user["id"]).maybe_single().execute()
-    )
-    plan_type = response.data.get("plan_type", "free") if response and response.data else "free"
+    user_id = current_user["id"]
 
-    # define max key count of plans
-    PLAN_LIMITS = {
-        "free": 1,
-        "lite": 2,
-        "pro": 5,
-        "business": float('inf') # infinity for enterprises
-    }
-    max_keys = PLAN_LIMITS.get(plan_type, 1)
-
-    # check key count of user
-    keys_query = await asyncio.to_thread(
-        lambda: supabase.table("api_keys").select("id", count="exact").eq("user_id", current_user["id"]).execute()
-    )
-    current_key_count = keys_query.count if keys_query.count is not None else 0
-
-    # check limit
-    if current_key_count >= max_keys:
-        raise HTTPException(
-            status_code=403, 
-            detail=f"API Key limit reached for {plan_type} plan. Maximum allowed: {max_keys}. Please delete an existing key to create a new one."
+    # test key: max 1 for every user
+    if key_type == "test":
+        test_res = await asyncio.to_thread(
+            lambda: supabase.table("api_keys").select("id", count="exact")
+            .eq("user_id", user_id).like("key_hint", "sk_test_%").execute()
         )
+        if (test_res.count or 0) >= 1:
+            raise HTTPException(status_code=403, detail="Max allowed test key count = 1")
     
-    # create random key
-    raw_key = f"sk_live_{secrets.token_urlsafe(32)}"
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-    key_hint = f"{raw_key[:8]}...{raw_key[-4:]}"
+    # live key
+    else:
+        profile = await asyncio.to_thread(
+            lambda: supabase.table("profiles").select("plan_type, custom_key_limit").eq("id", user_id).maybe_single().execute()
+        )
+        profile_data = profile.data or {}
+        plan_type = profile_data.get("plan_type", "free")
+        
+        # get limit, use default if not found
+        if plan_type == "business":
+            max_live = profile_data.get("custom_key_limit") or DEFAULT_BUSINESS_PACKAGE_MAX_LIVE_KEY_LIMIT
+        else:
+            max_live = PLAN_KEY_LIMITS.get(plan_type, 1)
 
-    try:
-        db_data = {
-            "user_id": current_user["id"],
-            "key_hash": key_hash,
+        live_res = await asyncio.to_thread(
+            lambda: supabase.table("api_keys").select("id", count="exact")
+            .eq("user_id", user_id).like("key_hint", "sk_live_%").execute()
+        )
+        if (live_res.count or 0) >= max_live:
+            raise HTTPException(status_code=403, detail=f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed pairs: {max_live}.")
+
+    # create random key
+    prefix = "sk_test_" if key_type == "test" else "sk_live_"
+    raw_key = f"{prefix}{secrets.token_urlsafe(32)}"
+    key_hint = f"{raw_key[:11]}...{raw_key[-4:]}"
+
+    db_data = {
+            "user_id": user_id,
+            "key_hash": hashlib.sha256(raw_key.encode()).hexdigest(),
             "key_hint": key_hint
         }
+
+    try:
         await asyncio.to_thread(
             lambda: supabase.table("api_keys").insert(db_data).execute()
         )
-
-        logger.info(f"New API key generated for user: {current_user['id']}")
+        logger.info(f"New API key pair generated for user: {current_user['id']}")
         return {
-            "api_key": raw_key, # raw_key only accessed from here
-            "key_hint": key_hint,
-            "message": "Save this key with safe. Cannot be read further."
+            "api_key": raw_key,
+            "type": key_type,
+            "message": "Save these keys safely. They cannot be read again."
         }
     except Exception as e:
         logger.error(f"Key generation error for user {current_user['id']}", exc_info=True)
@@ -364,8 +378,29 @@ async def analyze_image(
     auth = Depends(rate_limiter)
 ):
     active_client_id = auth["id"]
+    is_test_mode = auth.get("is_test", False)
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     start_time = time.time()
+
+    # ---- TEST MODE ----
+    if is_test_mode:
+        logger.info(f"Test analysis successful - Request: {request_id}, User: {active_client_id}")
+        return {
+            "request_id": request_id,
+            "status": "success",
+            "results": {
+                "verdict": {"action": "ACCEPT","risk_level": "LOW","label": "AUTHENTIC"},
+                "summary": {
+                    "description": "No synthetic face swap or fully AI-generated identity was detected (Test Mode).",
+                    "recommendation": "Meets identity verification standards. Acceptable."
+                },
+                "scores": {"ai_generated": 0.01,"deepfake": 0.01}
+            },
+            "meta": {
+                "credits_remaining": "unlimited (test mode)",
+                "processing_time_ms": int((time.time() - start_time) * 1000)
+            }
+        }
 
     # file extension check
     file_ext = os.path.splitext(file.filename)[1].lower()
