@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -12,6 +12,13 @@ from starlette.requests import Request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from datetime import datetime, timezone
+
+# logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # security
 MIN_FILE_SIZE = 50 * 1024 # 50 KB (trash)
@@ -124,7 +131,7 @@ async def has_human_face(image_bytes: bytes) -> bool:
         return False
         
     except Exception as e:
-        print(f"Face detection engine failed: {str(e)}")
+        logger.error("Face detection engine failed", exc_info=True)
         raise RuntimeError("Face detection engine failed") from e
 
 # jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir
@@ -153,6 +160,7 @@ async def get_auth_user(
             pass
 
     # unauthorized
+    logger.warning("Unauthorized API access attempt.")
     raise HTTPException(status_code=401, detail={"error_code": "UNAUTHORIZED", "message": "unauthorized."})
 
 async def rate_limiter(auth = Depends(get_auth_user)):
@@ -189,10 +197,12 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         # A. Saniyelik Kontrol (Son 1 saniye)
         requests_last_sec = [t for t in all_requests if now - t < 1.0]
         if len(requests_last_sec) >= sec_limit:
+            logger.warning(f"Rate limit(second) exceeded for user: {user_id}")
             raise HTTPException(status_code=429, detail="Rate limit(seconds) exceeded")
         
         # B. Dakikalık Kontrol (Son 60 saniye)
         if len(all_requests) >= minute_limit:
+            logger.warning(f"Rate limit(minute) exceeded for user: {user_id}")
             raise HTTPException(status_code=429, detail=f"Exceeded minute limit: ({minute_limit} req/min).")
             
         # İstek başarılı, zaman damgasını ekle
@@ -234,6 +244,7 @@ async def check_daily_limit(user_id: str, plan_type: str):
 
     # Limit Aşım Kontrolü
     if daily_usage >= daily_limit:
+        logger.warning(f"Daily limit exceeded for user: {user_id}")
         raise HTTPException(
             status_code=429, 
             detail=f"Daily usage limit exceeded: max = {daily_limit}."
@@ -289,14 +300,14 @@ async def generate_api_key(
             lambda: supabase.table("api_keys").insert(db_data).execute()
         )
 
-        # raw_key only accessed from here
+        logger.info(f"New API key generated for user: {current_user['id']}")
         return {
-            "api_key": raw_key,
+            "api_key": raw_key, # raw_key only accessed from here
             "key_hint": key_hint,
             "message": "Save this key with safe. Cannot be read further."
         }
     except Exception as e:
-        print(f"Key Error: {e}")
+        logger.error(f"Key generation error for user {current_user['id']}", exc_info=True)
         raise HTTPException(status_code=500, detail="Key generation error")
 
 # decision matrix
@@ -390,6 +401,7 @@ async def analyze_image(
     plan_type = profile_data.get("plan_type", "free")
 
     if current_credits <= 0:
+        logger.warning(f"Insufficient credits for user: {active_client_id}")
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Not enough credits, please do payment"
@@ -404,6 +416,7 @@ async def analyze_image(
         try:
             is_human = await has_human_face(content)
         except Exception as face_err:
+            logger.error(f"Face detection error for request {request_id}", exc_info=True)
             raise HTTPException(
                 status_code=500, 
                 detail={"error": "Face detection service temporarily unavailable. No credits deducted."}
@@ -429,6 +442,7 @@ async def analyze_image(
             result = response.json()
 
             if result.get("status") != "success":
+                logger.error(f"Sightengine API error for request {request_id}: {result}")
                 raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
 
             genai_score = result.get("type", {}).get("ai_generated", 0)
@@ -473,6 +487,7 @@ async def analyze_image(
             )
             new_credits = rpc_response.data
         except Exception as db_err:
+            logger.error(f"Billing/DB transaction failed for request {request_id}", exc_info=True)
             # İşlem DB seviyesinde reddedildi, eklenen çöp verileri temizle
             await asyncio.to_thread(
                 lambda: supabase.table("analysis_history").delete().eq("id", history_id).execute()
@@ -481,6 +496,7 @@ async def analyze_image(
             except: pass
             raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi veya günlük sayaç artırılamadı, işlem iptal edildi."})
         
+        logger.info(f"Analysis success - Request: {request_id}, User: {active_client_id}")
         return {
             "request_id": request_id,
             "status": "success",
@@ -505,7 +521,7 @@ async def analyze_image(
             }
         }
     except Exception as e:
-        print(f"error details: {e}")
+        logger.error(f"Analysis general error for request {request_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"request_id": request_id, "error": str(e)})
 
 # jwt + api
@@ -527,6 +543,7 @@ async def get_history(
         )
         return response.data
     except Exception as e:
+        logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 class UserRegister(BaseModel):
@@ -554,12 +571,13 @@ def register(user: UserRegister):
                 detail="User could not be created"
             )
 
+        logger.info(f"Register success for user: {user.email}")
         return {
             "message": "user register success for " + user.email, 
             "user": response.user
         }
     except Exception as e:
-        print(f"error details: {repr(e)}")
+        logger.error(f"Register error for {user.email}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     
 class UserLogin(BaseModel):
@@ -575,6 +593,7 @@ def login(user: UserLogin):
             "password": user.password
         })
 
+        logger.info(f"Login success for user: {user.email}")
         # Supabase, JWT'yi otomatik olarak üretir
         return {
             "message": "login success",
@@ -583,7 +602,7 @@ def login(user: UserLogin):
             "token_type": "bearer"
         }
     except Exception as e:
-        print(f"error details: {e}")
+        logger.error(f"Login error for {user.email}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.get("/me")
@@ -601,6 +620,7 @@ async def lemon_squeezy_webhook(request: Request):
     signature = request.headers.get("X-Signature")
     
     if not signature:
+        logger.warning("Webhook signature verification failed.")
         raise HTTPException(status_code=400, detail="Missing signature")
 
     body = await request.body()
@@ -608,6 +628,7 @@ async def lemon_squeezy_webhook(request: Request):
     # Güvenlik Doğrulaması
     hash_obj = hmac.new(secret, body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(hash_obj, signature):
+        logger.warning("Webhook signature verification failed.")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = json.loads(body)
@@ -622,9 +643,7 @@ async def lemon_squeezy_webhook(request: Request):
     variant_id = str(attributes.get("variant_id"))
 
     # BÖCEK AVI
-    print(f"GELEN EVENT: {event_name}")
-    print(f"GELEN VARIANT ID: {variant_id}")
-    print(f"GELEN USER ID: {user_id}")
+    logger.info(f"Webhook received - Event: {event_name}, Variant: {variant_id}, User: {user_id}")
 
     # lemon squeezy variants
     LITE_VARIANT_ID = "1490345"
@@ -664,7 +683,7 @@ async def lemon_squeezy_webhook(request: Request):
 
             # 3. Variant ID yok ve ödeme başarılı eventi değilse
             else:
-                print(f"Atlanan Event: {event_name} - Variant ID eksik veya gecersiz: {variant_id}")
+                logger.warning(f"Webhook skipped - Event: {event_name}, Variant: {variant_id}")
                 return {"status": "ignored", "reason": "Missing or unknown variant_id"}
             
             # Veritabanını Güncelle (Kredi ve Günlük Hak Sıfırlama)
@@ -704,5 +723,5 @@ async def lemon_squeezy_webhook(request: Request):
         return {"status": "success"}
     
     except Exception as e:
-        print(f"Webhook Error: {str(e)}")
+        logger.error("Webhook processing error", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
