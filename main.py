@@ -11,6 +11,7 @@ from supabase import create_client, Client
 from starlette.requests import Request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from datetime import datetime, timezone
 
 # security
 MIN_FILE_SIZE = 50 * 1024 # 50 KB (trash)
@@ -21,11 +22,33 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 # rate limiting
 RATE_LIMIT_STORAGE = {} # Rate limit için in-memory storage (MVP için yeterli)
 RATE_LIMIT_LOCK = asyncio.Lock()
-PACKAGE_LIMITS = { # rate limit for packages
+PACKAGE_LIMITS = { # rate limit / second for packages
     "free": 1,
     "lite": 1,
     "pro": 1
 }
+PACKAGE_LIMITS_MINUTE = { # rate limit / minute for packages
+    "free": 5,
+    "lite": 20,
+    "pro": 60
+}
+# monthly limit
+MONTHLY_LIMITS = {
+    "free": 50,
+    "lite": 500,
+    "pro": 2000
+}
+# daily limit
+DAILY_LIMITS = {
+    "free": 10,
+    "lite": 75,
+    "pro": 300
+}
+# business package default limits, theese used if data not fount at database
+DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_SECOND = 5
+DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_MINUTE = 120
+DEFAULT_BUSINESS_PACKAGE_DAILY_CREDITS_LIMIT = 500
+DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT = 5000
 
 app = FastAPI(title="checkai b2b api", version="1.0.0")
 
@@ -137,38 +160,86 @@ async def rate_limiter(auth = Depends(get_auth_user)):
 
     # Kullanıcının planını ve (varsa) özel limitini DB'den al
     profile_res = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("plan_type, custom_rate_limit").eq("id", user_id).maybe_single().execute()
+        lambda: supabase.table("profiles")
+        .select("plan_type, custom_rate_limit, custom_rate_limit_min")
+        .eq("id", user_id).maybe_single().execute()
     )
     profile = profile_res.data or {}
-    
     plan_type = profile.get("plan_type", "free")
     
     # 1. Limit Belirleme
     if plan_type == "business":
-        limit = profile.get("custom_rate_limit") or 5 # DB'de yoksa varsayılan 5
+        sec_limit = profile.get("custom_rate_limit") or DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_SECOND
+        minute_limit = profile.get("custom_rate_limit_min") or DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_MINUTE
     else:
-        limit = PACKAGE_LIMITS.get(plan_type, 1)
+        sec_limit = PACKAGE_LIMITS.get(plan_type, 1)
+        minute_limit = PACKAGE_LIMITS_MINUTE.get(plan_type, 5)
 
-    # 2. Limit Kontrolü (1 Saniyelik Pencere)
+    # 2. Limit Kontrolü
     async with RATE_LIMIT_LOCK:
         now = time.time()
 
         if user_id not in RATE_LIMIT_STORAGE:
             RATE_LIMIT_STORAGE[user_id] = []
         
-        # Sadece son 1 saniye içindeki istekleri bellekte tut
-        RATE_LIMIT_STORAGE[user_id] = [t for t in RATE_LIMIT_STORAGE[user_id] if now - t < 1.0]
+        # Temizlik: 60 saniyeden eski tüm istekleri bellekten at
+        RATE_LIMIT_STORAGE[user_id] = [t for t in RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
+        all_requests = RATE_LIMIT_STORAGE[user_id]
+
+        # A. Saniyelik Kontrol (Son 1 saniye)
+        requests_last_sec = [t for t in all_requests if now - t < 1.0]
+        if len(requests_last_sec) >= sec_limit:
+            raise HTTPException(status_code=429, detail="Rate limit(seconds) exceeded")
         
-        if len(RATE_LIMIT_STORAGE[user_id]) >= limit:
-            raise HTTPException(
-                status_code=429, 
-                detail=f"Rate limit exceeded. Your {plan_type} plan allows {limit} requests per second."
-            )
+        # B. Dakikalık Kontrol (Son 60 saniye)
+        if len(all_requests) >= minute_limit:
+            raise HTTPException(status_code=429, detail=f"Exceeded minute limit: ({minute_limit} req/min).")
             
+        # İstek başarılı, zaman damgasını ekle
         RATE_LIMIT_STORAGE[user_id].append(now)
 
     # Endpoint'in kullanması için auth datayı geri dön
     return auth
+
+async def check_daily_limit(user_id: str, plan_type: str):
+    res = await asyncio.to_thread(
+        lambda: supabase.table("profiles")
+        .select("daily_usage, last_daily_usage_reset, custom_daily_limit")
+        .eq("id", user_id).maybe_single().execute()
+    )
+    profile = res.data or {}
+    
+    daily_usage = profile.get("daily_usage", 0)
+    last_reset_str = profile.get("last_daily_usage_reset")
+    if plan_type == "business":
+        daily_limit = profile.get("custom_daily_limit") or DEFAULT_BUSINESS_PACKAGE_DAILY_CREDITS_LIMIT
+    else:
+        daily_limit = DAILY_LIMITS.get(plan_type)
+
+    now = datetime.now(timezone.utc)
+    
+    # 24 Saat Kontrolü ve Sıfırlama
+    if not last_reset_str:
+        last_reset_str = now.isoformat()
+        
+    last_reset = datetime.fromisoformat(last_reset_str.replace('Z', '+00:00'))
+    
+    if (now - last_reset).total_seconds() >= 86400:
+        daily_usage = 0
+        await asyncio.to_thread(
+            lambda: supabase.table("profiles")
+            .update({"daily_usage": 0, "last_daily_usage_reset": now.isoformat()})
+            .eq("id", user_id).execute()
+        )
+
+    # Limit Aşım Kontrolü
+    if daily_usage >= daily_limit:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Daily usage limit exceeded: max = {daily_limit}."
+        )
+    
+    return daily_usage
 
 # jwt
 @app.post("/generate-api-key")
@@ -312,15 +383,21 @@ async def analyze_image(
 
     # check credits
     user_query = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("credits").eq("id", active_client_id).single().execute()
+        lambda: supabase.table("profiles").select("credits, plan_type").eq("id", active_client_id).maybe_single().execute()
     )
-    current_credits = user_query.data.get("credits", 0) if user_query.data else 0
+    profile_data = user_query.data or {}
+    current_credits = profile_data.get("credits", 0)
+    plan_type = profile_data.get("plan_type", "free")
+
     if current_credits <= 0:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail="Not enough credits, please do payment"
         )
     
+    # --- GÜNLÜK LİMİT KONTROLÜ ---
+    await check_daily_limit(active_client_id, plan_type)
+
     try:
         content = await file.read()
         
@@ -389,20 +466,20 @@ async def analyze_image(
         )
         history_id = db_insert_response.data[0]['id']
 
-        # güvenli kredi düşme ve rollback (rpc)
+        # güvenli kredi düşme ve günlük sayaç artırma
         try:
             rpc_response = await asyncio.to_thread(
-                lambda: supabase.rpc("decrement_credit", {"user_id": active_client_id}).execute()
+                lambda: supabase.rpc("process_analysis_billing_2", {"user_id": active_client_id}).execute()
             )
             new_credits = rpc_response.data
         except Exception as db_err:
-            # Kredi düşme başarısız olursa işlemleri geri al (Rollback)
+            # İşlem DB seviyesinde reddedildi, eklenen çöp verileri temizle
             await asyncio.to_thread(
                 lambda: supabase.table("analysis_history").delete().eq("id", history_id).execute()
             )
             try: supabase.storage.from_("images").remove([file_path])
             except: pass
-            raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi, işlem iptal edildi."})
+            raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi veya günlük sayaç artırılamadı, işlem iptal edildi."})
         
         return {
             "request_id": request_id,
@@ -513,11 +590,11 @@ def login(user: UserLogin):
 async def get_me(auth = Depends(rate_limiter)):
     user_id = auth["id"]
     profile = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+        lambda: supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
     )
-    return profile.data
+    return profile.data or {}
 
-#webhook
+# bir işlemden sonra lemon_squeezy buraya istek atar
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
@@ -537,6 +614,13 @@ async def lemon_squeezy_webhook(request: Request):
     event_name = payload.get("meta", {}).get("event_name")
     custom_data = payload.get("meta", {}).get("custom_data", {})
     user_id = custom_data.get("user_id")
+    attributes = payload.get("data", {}).get("attributes", {})
+    variant_id = str(attributes.get("variant_id"))
+
+    # BÖCEK AVI İÇİN BU İKİ SATIRI EKLE:
+    print(f"GELEN EVENT: {event_name}")
+    print(f"GELEN VARIANT ID: {variant_id}")
+    print(f"GELEN USER ID: {user_id}")
 
     if not user_id:
         return {"status": "ignored", "reason": "user_id not found"}
@@ -550,32 +634,54 @@ async def lemon_squeezy_webhook(request: Request):
     BUSINESS_VARIANT_ID = "1490341"
 
     try:
-        # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi direkt setler)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
         if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
             plan_type = "free"
-            credits = 50
+            credits = MONTHLY_LIMITS.get(plan_type)
             
-            if variant_id == LITE_VARIANT_ID:
+            if variant_id == LITE_VARIANT_ID: 
                 plan_type = "lite"
-                credits = 500
-            elif variant_id == PRO_VARIANT_ID:
+                credits = MONTHLY_LIMITS.get(plan_type)
+            elif variant_id == PRO_VARIANT_ID: 
                 plan_type = "pro"
-                credits = 2000
+                credits = MONTHLY_LIMITS.get(plan_type)
             elif variant_id == BUSINESS_VARIANT_ID:
                 plan_type = "business"
-                # custom_data içinden anlaştığın limiti çek, gelmezse fallback olarak 5000 ata
-                credits = int(custom_data.get("custom_credits", 5000))
+                credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
                 
             await asyncio.to_thread(
-                lambda: supabase.table("profiles").update({"plan_type": plan_type,"credits": credits}).eq("id", user_id).execute()
+                lambda: supabase.table("profiles")
+                    .update({
+                        "plan_type": plan_type,
+                        "credits": credits,
+                        "daily_usage": 0,                   # Yenilenmede günlük hak sıfırlanır
+                        "last_daily_usage_reset": now_iso   # Sayaç an itibariyle baştan başlar
+                    }).eq("id", user_id).execute()
             )
             
         # Abonelik süresi tamamen bittiğinde (Free plana düşürür)
         elif event_name == 'subscription_expired':
             await asyncio.to_thread(
-                lambda: supabase.table("profiles").update({"plan_type": "free","credits": 50}).eq("id", user_id).execute()
+                lambda: supabase.table("profiles")
+                    .update({
+                        "plan_type": "free",
+                        "credits": MONTHLY_LIMITS.get("free"),
+                        "daily_usage": 0,                   # Plan düştüğünde hakları sıfırdan başlar
+                        "last_daily_usage_reset": now_iso
+                    }).eq("id", user_id).execute()
             )
-
+        elif event_name in ['order_refunded', 'subscription_cancelled']:
+            await asyncio.to_thread(
+                lambda: supabase.table("profiles")
+                    .update({
+                        "plan_type": "free",
+                        "credits": 0, # İade yapıldıysa kredisi tamamen sıfırlanmalı
+                        "daily_usage": 0,
+                        "last_daily_usage_reset": now_iso
+                    }).eq("id", user_id).execute()
+            )
         return {"status": "success"}
     
     except Exception as e:
