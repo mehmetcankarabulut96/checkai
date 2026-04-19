@@ -27,7 +27,9 @@ ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # rate limiting
-RATE_LIMIT_STORAGE = {} # Rate limit için in-memory storage (MVP için yeterli)
+# RATE_LIMIT_STORAGE in-memory çalışıyor. Tek bir worker ile bu durum sorun yaratmaz.
+# Eğer ileride sunucuda birden fazla worker çalışacaksa her workerin kendi belleği olacağından Redis entegrasyonu yapılmalıdır.
+RATE_LIMIT_STORAGE = {}
 RATE_LIMIT_LOCK = asyncio.Lock()
 PACKAGE_LIMITS = { # rate limit / second for packages
     "free": 1,
@@ -104,8 +106,10 @@ try:
         min_detection_confidence=0.5
     )
     face_detector = vision.FaceDetector.create_from_options(options)
+    logger.info("MediaPipe Face Detector loaded successfully.")
 except Exception as e:
-    print(f"tflite model could not be loaded, details: {e}")
+    logger.critical(f"FATAL: MediaPipe model could not be loaded: {e}")
+    raise RuntimeError(f"Model load failure: {e}")
 
 async def has_human_face(image_bytes: bytes) -> bool:
     """
@@ -498,7 +502,7 @@ async def analyze_image(
         supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
         image_url = supabase.storage.from_("images").get_public_url(file_path)
 
-        # DB'ye kaydet
+        # db insert
         db_data = {
             "user_id": active_client_id,
             "image_url": image_url,
@@ -510,15 +514,28 @@ async def analyze_image(
             "user_request_id": request_id,
             "provider_request_id": provider_req_id
         }
-        db_insert_response = await asyncio.to_thread(
-            lambda: supabase.table("analysis_history").insert(db_data).execute()
-        )
-        history_id = db_insert_response.data[0]['id']
+        try:
+            db_insert_response = await asyncio.to_thread(
+                lambda: supabase.table("analysis_history").insert(db_data).execute()
+            )
+            # empty result
+            if not db_insert_response.data:
+                logger.error(f"Database insertion failed (Empty Data) for request {request_id}")
+                # clear
+                try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
+                except: pass
+                raise HTTPException(status_code=500, detail="Analysis could not be saved.")
+            history_id = db_insert_response.data[0]['id']
+        except Exception as e:
+            logger.error(f"Database technical exception for request {request_id}: {str(e)}")
+            try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
+            except: pass
+            raise HTTPException(status_code=500, detail="Database connection error.")
 
         # güvenli kredi düşme ve günlük sayaç artırma
         try:
             rpc_response = await asyncio.to_thread(
-                lambda: supabase.rpc("process_analysis_billing_2", {"user_id": active_client_id}).execute()
+                lambda: supabase.rpc("process_analysis_billing", {"user_id": active_client_id}).execute()
             )
             new_credits = rpc_response.data
         except Exception as db_err:
@@ -688,10 +705,12 @@ async def lemon_squeezy_webhook(request: Request):
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
-        if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
+        # Veritabanına gönderilecek ana paket
+        update_data = {}
 
-            # 1. Variant ID varsa (Yeni Abonelik / Paket Değişimi)
+        # 1. Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
+        if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
+            # Durum A: Variant ID varsa (Yeni Abonelik / Paket Değişimi)
             if variant_id in [LITE_VARIANT_ID, PRO_VARIANT_ID, BUSINESS_VARIANT_ID]:
                 if variant_id == LITE_VARIANT_ID: 
                     plan_type = "lite"
@@ -702,8 +721,15 @@ async def lemon_squeezy_webhook(request: Request):
                 elif variant_id == BUSINESS_VARIANT_ID:
                     plan_type = "business"
                     credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
+                    # Business'a özel limitleri custom_data'dan çek ve ekle
+                    update_data.update({
+                        "custom_rate_limit": custom_data.get("custom_rate_limit"),
+                        "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
+                        "custom_daily_limit": custom_data.get("custom_daily_limit"),
+                        "custom_key_limit": custom_data.get("custom_key_limit")
+                    })
 
-            # 2. Variant ID yok ama Ödeme Başarılı ise (Aylık Düzenli Yenileme)
+            # Durum B: Variant ID yok ama Ödeme Başarılı ise (Aylık Düzenli Yenileme)
             elif event_name == 'subscription_payment_success':
                 db_profile = await asyncio.to_thread(
                     lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
@@ -716,45 +742,57 @@ async def lemon_squeezy_webhook(request: Request):
                     
                 credits = MONTHLY_LIMITS.get(plan_type, DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
 
-            # 3. Variant ID yok ve ödeme başarılı eventi değilse
+            # Durum C: Variant ID yok ve ödeme başarılı eventi değilse
             else:
                 logger.warning(f"Webhook skipped - Event: {event_name}, Variant: {variant_id}")
                 return {"status": "ignored", "reason": "Missing or unknown variant_id"}
             
-            # Veritabanını Güncelle (Kredi ve Günlük Hak Sıfırlama)
-            await asyncio.to_thread(
-                lambda: supabase.table("profiles")
-                    .update({
-                        "plan_type": plan_type,
-                        "credits": credits,
-                        "daily_usage": 0,                   # Yenilenmede günlük hak sıfırlanır
-                        "last_daily_usage_reset": now_iso   # Sayaç an itibariyle baştan başlar
-                    }).eq("id", user_id).execute()
-            )
+            # Ortak güncellenecek alanları update_data'ya ekle
+            update_data.update({
+                "plan_type": plan_type,
+                "credits": credits,
+                "daily_usage": 0,
+                "last_daily_usage_reset": now_iso
+            })
             
-        # Abonelik süresi tamamen bittiğinde (Free plana düşürür)
+        # 2. Abonelik süresi tamamen bittiğinde (Free plana düşürür)
         elif event_name == 'subscription_expired':
-            await asyncio.to_thread(
-                lambda: supabase.table("profiles")
-                    .update({
-                        "plan_type": "free",
-                        "credits": MONTHLY_LIMITS.get("free"),
-                        "daily_usage": 0,                   # Plan düştüğünde hakları sıfırdan başlar
-                        "last_daily_usage_reset": now_iso
-                    }).eq("id", user_id).execute()
-            )
+            update_data = {
+                "plan_type": "free",
+                "credits": MONTHLY_LIMITS.get("free"),
+                "daily_usage": 0,
+                "last_daily_usage_reset": now_iso,
+                # Business'tan düşüyorsa özel limitleri temizle (isteğe bağlı)
+                "custom_rate_limit": None,
+                "custom_rate_limit_min": None,
+                "custom_daily_limit": None,
+                "custom_key_limit": None
+            }
 
-        # İade veya İptal durumunda
+        # 3. İade veya İptal durumunda
         elif event_name in ['order_refunded']:
+            update_data = {
+                "plan_type": "free",
+                "credits": 0,
+                "daily_usage": 0,
+                "last_daily_usage_reset": now_iso
+            }
+        
+        # Hazırlanan update_data'yı veritabanına gönder
+        if update_data:
             await asyncio.to_thread(
                 lambda: supabase.table("profiles")
-                    .update({
-                        "plan_type": "free",
-                        "credits": 0, # İade yapıldıysa kredisi tamamen sıfırlanmalı
-                        "daily_usage": 0,
-                        "last_daily_usage_reset": now_iso
-                    }).eq("id", user_id).execute()
+                    .update(update_data) # <--- Kritik nokta: Elinle yazmak yerine değişkeni verdik
+                    .eq("id", user_id)
+                    .execute()
             )
+            logger.info(f"Successfully updated profile for user {user_id}")
+        else:
+            # Bilinen bir event geldi ama hiçbir mantığa girmediyse BURASI KRİTİK
+            if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
+                logger.error(f"CRITICAL: Payment event received but update_data is empty! Payload: {payload}")
+                raise HTTPException(status_code=422, detail="Update data could not be constructed")
+            
         return {"status": "success"}
     
     except Exception as e:
