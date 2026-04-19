@@ -691,7 +691,7 @@ async def lemon_squeezy_webhook(request: Request):
             )
 
         # İade veya İptal durumunda
-        elif event_name in ['order_refunded', 'subscription_cancelled']:
+        elif event_name in ['order_refunded']:
             await asyncio.to_thread(
                 lambda: supabase.table("profiles")
                     .update({
