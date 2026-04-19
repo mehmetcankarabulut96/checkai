@@ -388,6 +388,9 @@ async def analyze_image(
 
     # ---- TEST MODE ----
     if is_test_mode:
+        # gerçekçi analiz süresi simülasyonu
+        await asyncio.sleep(1.2)
+        
         logger.info(f"Test analysis successful - Request: {request_id}, User: {active_client_id}")
         return {
             "request_id": request_id,
