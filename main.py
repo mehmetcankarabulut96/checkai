@@ -614,19 +614,17 @@ async def lemon_squeezy_webhook(request: Request):
     event_name = payload.get("meta", {}).get("event_name")
     custom_data = payload.get("meta", {}).get("custom_data", {})
     user_id = custom_data.get("user_id")
-    attributes = payload.get("data", {}).get("attributes", {})
-    variant_id = str(attributes.get("variant_id"))
-
-    # BÖCEK AVI İÇİN BU İKİ SATIRI EKLE:
-    print(f"GELEN EVENT: {event_name}")
-    print(f"GELEN VARIANT ID: {variant_id}")
-    print(f"GELEN USER ID: {user_id}")
 
     if not user_id:
         return {"status": "ignored", "reason": "user_id not found"}
-
+    
     attributes = payload.get("data", {}).get("attributes", {})
     variant_id = str(attributes.get("variant_id"))
+
+    # BÖCEK AVI
+    print(f"GELEN EVENT: {event_name}")
+    print(f"GELEN VARIANT ID: {variant_id}")
+    print(f"GELEN USER ID: {user_id}")
 
     # lemon squeezy variants
     LITE_VARIANT_ID = "1490345"
@@ -638,19 +636,38 @@ async def lemon_squeezy_webhook(request: Request):
 
         # Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
         if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
-            plan_type = "free"
-            credits = MONTHLY_LIMITS.get(plan_type)
-            
-            if variant_id == LITE_VARIANT_ID: 
-                plan_type = "lite"
-                credits = MONTHLY_LIMITS.get(plan_type)
-            elif variant_id == PRO_VARIANT_ID: 
-                plan_type = "pro"
-                credits = MONTHLY_LIMITS.get(plan_type)
-            elif variant_id == BUSINESS_VARIANT_ID:
-                plan_type = "business"
-                credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
+
+            # 1. Variant ID varsa (Yeni Abonelik / Paket Değişimi)
+            if variant_id in [LITE_VARIANT_ID, PRO_VARIANT_ID, BUSINESS_VARIANT_ID]:
+                if variant_id == LITE_VARIANT_ID: 
+                    plan_type = "lite"
+                    credits = MONTHLY_LIMITS.get(plan_type)
+                elif variant_id == PRO_VARIANT_ID: 
+                    plan_type = "pro"
+                    credits = MONTHLY_LIMITS.get(plan_type)
+                elif variant_id == BUSINESS_VARIANT_ID:
+                    plan_type = "business"
+                    credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
+
+            # 2. Variant ID yok ama Ödeme Başarılı ise (Aylık Düzenli Yenileme)
+            elif event_name == 'subscription_payment_success':
+                db_profile = await asyncio.to_thread(
+                    lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
+                )
+                profile_data = db_profile.data or {}
+                plan_type = profile_data.get("plan_type", "free")
                 
+                if plan_type == "free":
+                    return {"status": "ignored", "reason": "Free plan payment success ignored"}
+                    
+                credits = MONTHLY_LIMITS.get(plan_type, DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
+
+            # 3. Variant ID yok ve ödeme başarılı eventi değilse
+            else:
+                print(f"Atlanan Event: {event_name} - Variant ID eksik veya gecersiz: {variant_id}")
+                return {"status": "ignored", "reason": "Missing or unknown variant_id"}
+            
+            # Veritabanını Güncelle (Kredi ve Günlük Hak Sıfırlama)
             await asyncio.to_thread(
                 lambda: supabase.table("profiles")
                     .update({
@@ -672,6 +689,8 @@ async def lemon_squeezy_webhook(request: Request):
                         "last_daily_usage_reset": now_iso
                     }).eq("id", user_id).execute()
             )
+
+        # İade veya İptal durumunda
         elif event_name in ['order_refunded', 'subscription_cancelled']:
             await asyncio.to_thread(
                 lambda: supabase.table("profiles")
@@ -685,4 +704,5 @@ async def lemon_squeezy_webhook(request: Request):
         return {"status": "success"}
     
     except Exception as e:
+        print(f"Webhook Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
