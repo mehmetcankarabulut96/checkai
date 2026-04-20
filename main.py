@@ -27,7 +27,11 @@ ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # rate limiting
-# RATE_LIMIT_STORAGE in-memory çalışıyor. Tek bir worker ile bu durum sorun yaratmaz.
+# Auth işlemleri için IP bazlı limit (Dakikada 5 deneme)
+AUTH_RATE_LIMIT_STORAGE = {}
+AUTH_LIMIT_PER_MINUTE = 5
+
+# RATE_LIMIT_STORAGE ve AUTH_RATE_LIMIT_STORAGE in-memory çalışıyor. Tek bir worker ile bu durum sorun yaratmaz.
 # Eğer ileride sunucuda birden fazla worker çalışacaksa her workerin kendi belleği olacağından Redis entegrasyonu yapılmalıdır.
 RATE_LIMIT_STORAGE = {}
 RATE_LIMIT_LOCK = asyncio.Lock()
@@ -145,6 +149,26 @@ async def has_human_face(image_bytes: bytes) -> bool:
     except Exception as e:
         logger.error("Face detection engine failed", exc_info=True)
         raise RuntimeError("Face detection engine failed") from e
+
+# register ve login endpointleri için limiter
+async def auth_rate_limiter(request: Request):
+    ip = request.client.host
+    async with RATE_LIMIT_LOCK:
+        now = time.time()
+        if ip not in AUTH_RATE_LIMIT_STORAGE:
+            AUTH_RATE_LIMIT_STORAGE[ip] = []
+        
+        # 60 saniyeden eski kayıtları temizle
+        AUTH_RATE_LIMIT_STORAGE[ip] = [t for t in AUTH_RATE_LIMIT_STORAGE[ip] if now - t < 60.0]
+        
+        if len(AUTH_RATE_LIMIT_STORAGE[ip]) >= AUTH_LIMIT_PER_MINUTE:
+            logger.warning(f"IP based rate limit exceeded for: {ip}")
+            raise HTTPException(
+                status_code=429, 
+                detail="Too many attempts. Please try again in a minute."
+            )
+            
+        AUTH_RATE_LIMIT_STORAGE[ip].append(now)
 
 # jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir.
 # test keyi de tespit eder
@@ -584,7 +608,9 @@ async def analyze_image(
 async def get_history(
     auth = Depends(rate_limiter)
 ):
-    # Kim gelirse gelsin user_id'sini al
+    # Test modunda kayıt tutmadığımız için canlı verileri sızdırmamak adına boş döneriz.
+    if auth.get("is_test"): return []
+    
     active_client_id = auth["id"]
 
     try:
@@ -606,7 +632,7 @@ class UserRegister(BaseModel):
     password: str
     account_type: str
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(auth_rate_limiter)])
 def register(user: UserRegister):
     try:
         # Supabase auth modülü parolayı kendisi şifreler
@@ -639,7 +665,7 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-@app.post("/login")
+@app.post("/login", dependencies=[Depends(auth_rate_limiter)])
 def login(user: UserLogin):
     try:
         # Supabase kullanıcının parolasını doğrular ve bir session döner
