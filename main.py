@@ -610,7 +610,7 @@ async def get_history(
 ):
     # Test modunda kayıt tutmadığımız için canlı verileri sızdırmamak adına boş döneriz.
     if auth.get("is_test"): return []
-    
+
     active_client_id = auth["id"]
 
     try:
@@ -718,6 +718,7 @@ async def lemon_squeezy_webhook(request: Request):
     user_id = custom_data.get("user_id")
 
     if not user_id:
+        logger.info(f"Webhook received but user_id missing. Payload: {payload}")
         return {"status": "ignored", "reason": "user_id not found"}
     
     attributes = payload.get("data", {}).get("attributes", {})
