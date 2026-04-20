@@ -723,6 +723,7 @@ async def lemon_squeezy_webhook(request: Request):
     
     attributes = payload.get("data", {}).get("attributes", {})
     variant_id = str(attributes.get("variant_id"))
+    billing_reason = attributes.get("billing_reason")
 
     # BÖCEK AVI
     logger.info(f"Webhook received - Event: {event_name}, Variant: {variant_id}, User: {user_id}")
@@ -761,6 +762,10 @@ async def lemon_squeezy_webhook(request: Request):
 
             # Durum B: Variant ID yok ama Ödeme Başarılı ise (Aylık Düzenli Yenileme)
             elif event_name == 'subscription_payment_success':
+                # İlk satın alma işleminde krediler subscription_created ile verildiği için bunu yoksay
+                if billing_reason == 'initial':
+                    return {"status": "ignored", "reason": "Initial payment handled by subscription_created"}
+                
                 db_profile = await asyncio.to_thread(
                     lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
                 )
@@ -769,8 +774,11 @@ async def lemon_squeezy_webhook(request: Request):
                 
                 if plan_type == "free":
                     return {"status": "ignored", "reason": "Free plan payment success ignored"}
-                    
-                credits = MONTHLY_LIMITS.get(plan_type, DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
+        
+                if plan_type == "business":
+                    credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
+                else:
+                    credits = MONTHLY_LIMITS.get(plan_type)
 
             # Durum C: Variant ID yok ve ödeme başarılı eventi değilse
             else:
