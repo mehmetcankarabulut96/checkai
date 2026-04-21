@@ -342,7 +342,7 @@ async def generate_api_key(
         await asyncio.to_thread(
             lambda: supabase.table("api_keys").insert(db_data).execute()
         )
-        logger.info(f"New API key pair generated for user: {current_user['id']}")
+        logger.info(f"New API key generated for user: {current_user['id']}")
         return {
             "api_key": raw_key,
             "type": key_type,
