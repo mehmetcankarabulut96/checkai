@@ -184,7 +184,8 @@ async def get_auth_user(
         result = await asyncio.to_thread(
             lambda: supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
         )
-        logger.info(f"result: {result}")
+        # TODO: business key için result.data = [] dönüyor
+        logger.info(f"key result: {result}")
         if result.data:
             return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
         
@@ -194,6 +195,7 @@ async def get_auth_user(
             user_response = await asyncio.to_thread(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
+            logger.info(f"jwt result: {user_response}")
             return {"id": user_response.user.id, "is_test": False}
         except:
             pass
@@ -211,6 +213,8 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         .select("plan_type, custom_rate_limit, custom_rate_limit_min")
         .eq("id", user_id).maybe_single().execute()
     )
+    # TODO: business jwt burada None dönüyor
+    logger.info(f"rate_limiter response: {profile}")
     profile = profile_res.data or {}
     plan_type = profile.get("plan_type", "free")
     
@@ -327,7 +331,7 @@ async def generate_api_key(
             .eq("user_id", user_id).like("key_hint", "sk_live_%").execute()
         )
         if (live_res.count or 0) >= max_live:
-            raise HTTPException(status_code=403, detail=f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed pairs: {max_live}.")
+            raise HTTPException(status_code=403, detail=f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed count: {max_live}.")
 
     # create random key
     prefix = "sk_test_" if key_type == "test" else "sk_live_"
