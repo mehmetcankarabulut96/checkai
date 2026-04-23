@@ -7,7 +7,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, EmailStr
-from supabase import create_client, Client
+from supabase import create_client, Client, AuthApiError
 from starlette.requests import Request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -682,9 +682,12 @@ def login(user: UserLogin):
             "refresh_token": response.session.refresh_token,
             "token_type": "bearer"
         }
+    except AuthApiError as e:
+        logger.warning(f"Invalid login attempt for {user.email}")
+        raise HTTPException(status_code=401, detail=str(e.message))
     except Exception as e:
         logger.error(f"Login error for {user.email}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
     
 @app.get("/me")
 async def get_me(auth = Depends(rate_limiter)):
