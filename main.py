@@ -176,18 +176,22 @@ async def get_auth_user(
     api_key: str = Depends(api_key_header),
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    logger.info(f"api_key: {api_key}")
-    # x-api-key
     if api_key:
+        api_key = api_key.strip()
         hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
+
         # supabase sorgusunu ayrı bir thread ile yapıyoruz, böylece saniye bazlı rate limit uygulayabiliriz
         result = await asyncio.to_thread(
             lambda: supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
         )
-        # TODO: business key için result.data = [] dönüyor
-        logger.info(f"key result: {result}")
+
         if result.data:
+            logger.info(f"api-key accepted: {api_key}")
             return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
+        
+        # api-key geçersiz ise jwt ye bakma
+        logger.warning(f"Invalid or inactive API key attempt. key: {api_key}")
+        raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
         
     # jwt
     if credentials:
@@ -195,10 +199,11 @@ async def get_auth_user(
             user_response = await asyncio.to_thread(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
-            logger.info(f"jwt result: {user_response}")
+            logger.info(f"jwt accepted: user: {user_response.user.id}")
             return {"id": user_response.user.id, "is_test": False}
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Invalid JWT attempt: {str(e)}")
+            raise HTTPException(status_code=401, detail={"error_code": "INVALID_JWT", "message": "Invalid or expired token."})
 
     # unauthorized
     logger.warning("Unauthorized API access attempt.")
