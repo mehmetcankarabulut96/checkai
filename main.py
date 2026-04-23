@@ -186,11 +186,11 @@ async def get_auth_user(
         )
 
         if result.data:
-            logger.info(f"api-key accepted: {api_key}")
+            logger.info(f"api-key accepted. key: {api_key} - hash: {hashed_key}")
             return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
         
         # api-key geçersiz ise jwt ye bakma
-        logger.warning(f"Invalid or inactive API key attempt. key: {api_key}")
+        logger.warning(f"Invalid or inactive API key attempt. key: {api_key} - hash: {hashed_key}")
         raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
         
     # jwt
@@ -218,9 +218,15 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         .select("plan_type, custom_rate_limit, custom_rate_limit_min")
         .eq("id", user_id).maybe_single().execute()
     )
-    # TODO: business jwt burada None dönüyor
-    logger.info(f"rate_limiter response: {profile_res}")
-    profile = profile_res.data or {}
+    profile = getattr(profile_res, "data", None)
+    if not profile:
+        logger.error(f"SECURITY/DATA RISK: Valid Auth but missing profile for user_id: {user_id}")
+        raise HTTPException(
+            status_code=403, 
+            detail={"error_code": "PROFILE_NOT_FOUND", "message": "User profile is missing or corrupted."}
+        )
+    
+    logger.info(f"Valid profile for user: {user_id}")
     plan_type = profile.get("plan_type", "free")
     
     # 1. Limit Belirleme
