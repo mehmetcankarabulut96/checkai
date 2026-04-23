@@ -214,7 +214,7 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         .eq("id", user_id).maybe_single().execute()
     )
     # TODO: business jwt burada None dönüyor
-    logger.info(f"rate_limiter response: {profile}")
+    logger.info(f"rate_limiter response: {profile_res}")
     profile = profile_res.data or {}
     plan_type = profile.get("plan_type", "free")
     
