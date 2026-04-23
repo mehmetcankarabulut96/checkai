@@ -176,6 +176,7 @@ async def get_auth_user(
     api_key: str = Depends(api_key_header),
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
+    logger.info(f"api_key: {api_key}")
     # x-api-key
     if api_key:
         hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
@@ -183,6 +184,7 @@ async def get_auth_user(
         result = await asyncio.to_thread(
             lambda: supabase.table("api_keys").select("user_id").eq("key_hash", hashed_key).eq("is_active", True).execute()
         )
+        logger.info(f"result: {result}")
         if result.data:
             return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
         
