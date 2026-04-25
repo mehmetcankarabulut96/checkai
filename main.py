@@ -237,7 +237,6 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             logger.warning(f"Invalid JWT attempt: {str(e)}")
             raise HTTPException(status_code=401, detail={"error_code": "INVALID_JWT", "message": "Invalid or expired token."})
     
-    # waitlist check
     if user_id:
         # tüm profil verisi burada çekilip endpointlere dağıtılıyor
         profile_res = await asyncio.to_thread(
@@ -776,13 +775,19 @@ def login(user: UserLogin):
             "password": user.password
         })
 
-        logger.info(f"Login success for user: {user.email}")
-        # Supabase, JWT'yi otomatik olarak üretir
+        # check waitlist
+        user_id = response.user.id
+        profile_res = supabase.table("profiles").select("is_allowed").eq("id", user_id).maybe_single().execute()
+        is_allowed = profile_res.data.get("is_allowed", False) if profile_res.data else False
+
+        logger.info(f"Login success for user: {user.email} - Allowed: {is_allowed}")
+
         return {
             "message": "login success",
             "access_token": response.session.access_token,
             "refresh_token": response.session.refresh_token,
-            "token_type": "bearer"
+            "token_type": "bearer",
+            "is_allowed": is_allowed
         }
     except AuthApiError as e:
         logger.warning(f"Invalid login attempt for {user.email}")
