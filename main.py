@@ -744,12 +744,7 @@ def register(user: UserRegister):
         # Supabase auth modülü parolayı kendisi şifreler
         response = supabase.auth.sign_up({
             "email": user.email,
-            "password": user.password,
-            "options": {
-                "data": {
-                    "account_type": user.account_type
-                }
-            }
+            "password": user.password
         })
 
         if response.user is None:
