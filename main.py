@@ -204,6 +204,10 @@ async def has_human_face(image_bytes: bytes) -> bool:
         raise RuntimeError("Face detection engine failed") from e
 
 async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTTPAuthorizationCredentials = Depends(security)):
+    user_id = None
+    auth_info = {}
+    
+    # API Key
     if api_key:
         api_key = api_key.strip()
         hashed_key = hashlib.sha256(api_key.encode()).hexdigest()
@@ -214,24 +218,49 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         )
 
         if result.data:
+            user_id = result.data[0]["user_id"]
+            auth_info = {"id": user_id, "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
             logger.info(f"api-key accepted. key: {api_key} - hash: {hashed_key}")
-            return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
-        
-        # api-key geçersiz ise jwt ye bakma
-        logger.warning(f"Invalid or inactive API key attempt. key: {api_key} - hash: {hashed_key}")
-        raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
-        
-    # jwt
-    if credentials:
+        else:
+            logger.warning(f"Invalid or inactive API key attempt. key: {api_key} - hash: {hashed_key}")
+            raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
+    # JWT
+    elif credentials:
         try:
             user_response = await asyncio.to_thread(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
-            logger.info(f"jwt accepted: user: {user_response.user.id}")
-            return {"id": user_response.user.id, "is_test": False, "auth_type": "jwt"}
+            user_id = user_response.user.id
+            auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt"}
+            logger.info(f"jwt accepted: user: {user_id}")
         except Exception as e:
             logger.warning(f"Invalid JWT attempt: {str(e)}")
             raise HTTPException(status_code=401, detail={"error_code": "INVALID_JWT", "message": "Invalid or expired token."})
+    
+    # waitlist check
+    if user_id:
+        # tüm profil verisi burada çekilip endpointlere dağıtılıyor
+        profile_res = await asyncio.to_thread(
+            lambda: supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
+        )
+        # profile_res objesi var mı ve hata içermiyor mu?
+        if not profile_res or hasattr(profile_res, "error") and profile_res.error:
+            logger.error(f"Supabase connection error for user {user_id}")
+            raise HTTPException(status_code=500, detail="Database connection failed.")
+        
+        # Veri (data) var mı? .data özelliği Supabase response'unda her zaman bulunur ama boşsa None döner.
+        profile = getattr(profile_res, "data", None)
+
+        # Profil verisi yoksa veya is_allowed False ise erişimi kes
+        if not profile or not profile.get("is_allowed", False):
+            logger.warning(f"Access denied: Profile missing or not allowed for user {user_id}")
+            raise HTTPException(
+                status_code=403, 
+                detail={"error_code": "WAITLIST_REQUIRED", "message": "Erişim izniniz bulunmuyor."}
+            )
+        
+        auth_info["profile"] = profile
+        return auth_info
 
     # unauthorized
     logger.warning("Unauthorized API access attempt.")
@@ -280,22 +309,7 @@ async def management_rate_limiter(auth = Depends(get_auth_user)):
 # planlara özel rate limiter
 async def rate_limiter(auth = Depends(get_auth_user)):
     user_id = auth["id"]
-
-    # Kullanıcının planını ve (varsa) özel limitini DB'den al
-    profile_res = await asyncio.to_thread(
-        lambda: supabase.table("profiles")
-        .select("plan_type, custom_rate_limit, custom_rate_limit_min")
-        .eq("id", user_id).maybe_single().execute()
-    )
-    profile = getattr(profile_res, "data", None)
-    if not profile:
-        logger.error(f"SECURITY/DATA RISK: Valid Auth but missing profile for user_id: {user_id}")
-        raise HTTPException(
-            status_code=403, 
-            detail={"error_code": "PROFILE_NOT_FOUND", "message": "User profile is missing or corrupted."}
-        )
-    
-    logger.info(f"Valid profile for user: {user_id}")
+    profile = auth["profile"]
     plan_type = profile.get("plan_type", "free")
     
     # 1. Limit Belirleme
@@ -334,16 +348,12 @@ async def rate_limiter(auth = Depends(get_auth_user)):
     # Endpoint'in kullanması için auth datayı geri dön
     return auth
 
-async def check_daily_limit(user_id: str, plan_type: str):
-    res = await asyncio.to_thread(
-        lambda: supabase.table("profiles")
-        .select("daily_usage, last_daily_usage_reset, custom_daily_limit")
-        .eq("id", user_id).maybe_single().execute()
-    )
-    profile = res.data or {}
-    
+async def check_daily_limit(profile: dict):
+    user_id = profile.get("id")
     daily_usage = profile.get("daily_usage", 0)
     last_reset_str = profile.get("last_daily_usage_reset")
+    plan_type = profile.get("plan_type", "free")
+
     if plan_type == "business":
         daily_limit = profile.get("custom_daily_limit") or DEFAULT_BUSINESS_PACKAGE_DAILY_CREDITS_LIMIT
     else:
@@ -394,10 +404,7 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
     
     # live key
     else:
-        profile = await asyncio.to_thread(
-            lambda: supabase.table("profiles").select("plan_type, custom_key_limit").eq("id", user_id).maybe_single().execute()
-        )
-        profile_data = profile.data or {}
+        profile_data = current_user.get("profile", {})
         plan_type = profile_data.get("plan_type", "free")
         
         # get limit, use default if not found
@@ -486,6 +493,7 @@ async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
 @app.post("/v1/analyze")
 async def analyze_image(request: Request, file: UploadFile = File(...), auth = Depends(rate_limiter)):
     active_client_id = auth["id"]
+    profile_data = auth["profile"]
     is_test_mode = auth.get("is_test", False)
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     start_time = time.time()
@@ -539,12 +547,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         )
 
     # check credits
-    user_query = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("credits, plan_type").eq("id", active_client_id).maybe_single().execute()
-    )
-    profile_data = user_query.data or {}
     current_credits = profile_data.get("credits", 0)
-    plan_type = profile_data.get("plan_type", "free")
 
     if current_credits <= 0:
         logger.warning(f"Insufficient credits for user: {active_client_id}")
@@ -554,7 +557,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         )
     
     # --- GÜNLÜK LİMİT KONTROLÜ ---
-    await check_daily_limit(active_client_id, plan_type)
+    await check_daily_limit(profile_data)
 
     try:
         content = await file.read()
@@ -793,13 +796,9 @@ async def get_me(auth = Depends(management_rate_limiter)):
     if auth.get("auth_type") == "api_key":
         raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
     
-    user_id = auth["id"]
-    profile = await asyncio.to_thread(
-        lambda: supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
-    )
-    return profile.data or {}
+    return auth.get("profile", {})
 
-# ?
+# X-signature
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
