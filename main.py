@@ -736,7 +736,6 @@ async def get_history(auth = Depends(management_rate_limiter)):
 class UserRegister(BaseModel):
     email: EmailStr
     password: str
-    account_type: str
 
 # will deprecated soon
 @app.post("/register", dependencies=[Depends(auth_rate_limiter)])
