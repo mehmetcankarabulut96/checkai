@@ -374,7 +374,7 @@ async def generate_api_key(
 
 # jwt
 @app.get("/api-keys")
-async def list_api_keys(current_user = Depends(rate_limiter)):
+async def list_api_keys(current_user = Depends(get_auth_user)):
     if current_user.get("auth_type") == "api_key":
         raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
     
@@ -687,7 +687,7 @@ async def analyze_image(
 # jwt
 @app.get("/history")
 async def get_history(
-    auth = Depends(rate_limiter)
+    auth = Depends(get_auth_user)
 ):
     if auth.get("auth_type") == "api_key":
         raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
@@ -774,7 +774,7 @@ def login(user: UserLogin):
 
 # jwt
 @app.get("/me")
-async def get_me(auth = Depends(rate_limiter)):
+async def get_me(auth = Depends(get_auth_user)):
     if auth.get("auth_type") == "api_key":
         raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
     
