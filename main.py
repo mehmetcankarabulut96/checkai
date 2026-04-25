@@ -170,8 +170,6 @@ async def auth_rate_limiter(request: Request):
             
         AUTH_RATE_LIMIT_STORAGE[ip].append(now)
 
-# jwt veya api-key ile gelen kullanıcıyı doğrular, öncelik x-api-keydir.
-# test keyi de tespit eder
 async def get_auth_user(
     api_key: str = Depends(api_key_header),
     credentials: HTTPAuthorizationCredentials = Depends(security)
@@ -187,7 +185,7 @@ async def get_auth_user(
 
         if result.data:
             logger.info(f"api-key accepted. key: {api_key} - hash: {hashed_key}")
-            return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_")}
+            return {"id": result.data[0]["user_id"], "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
         
         # api-key geçersiz ise jwt ye bakma
         logger.warning(f"Invalid or inactive API key attempt. key: {api_key} - hash: {hashed_key}")
@@ -200,7 +198,7 @@ async def get_auth_user(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
             logger.info(f"jwt accepted: user: {user_response.user.id}")
-            return {"id": user_response.user.id, "is_test": False}
+            return {"id": user_response.user.id, "is_test": False, "auth_type": "jwt"}
         except Exception as e:
             logger.warning(f"Invalid JWT attempt: {str(e)}")
             raise HTTPException(status_code=401, detail={"error_code": "INVALID_JWT", "message": "Invalid or expired token."})
@@ -309,9 +307,13 @@ async def check_daily_limit(user_id: str, plan_type: str):
 # jwt
 @app.post("/generate-api-key")
 async def generate_api_key(
+    name: str = "Default Key",
     key_type: str = "live",
     current_user = Depends(rate_limiter)
 ):
+    if current_user.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+    
     user_id = current_user["id"]
 
     # test key: max 1 for every user
@@ -352,7 +354,8 @@ async def generate_api_key(
     db_data = {
             "user_id": user_id,
             "key_hash": hashlib.sha256(raw_key.encode()).hexdigest(),
-            "key_hint": key_hint
+            "key_hint": key_hint,
+            "name": name
         }
 
     try:
@@ -368,6 +371,49 @@ async def generate_api_key(
     except Exception as e:
         logger.error(f"Key generation error for user {current_user['id']}", exc_info=True)
         raise HTTPException(status_code=500, detail="Key generation error")
+
+# jwt
+@app.get("/api-keys")
+async def list_api_keys(current_user = Depends(rate_limiter)):
+    if current_user.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+    
+    user_id = current_user["id"]
+    
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase.table("api_keys")
+            .select("id, name, key_hint, created_at")
+            .eq("user_id", user_id)
+            .eq("is_active", True)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data
+    except Exception as e:
+        logger.error(f"Error fetching API keys for user {user_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not fetch API keys")
+
+# jwt
+@app.delete("/api-keys/{key_id}")
+async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
+    if current_user.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+    
+    user_id = current_user["id"]
+    
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("api_keys")
+            .update({"is_active": False}) # soft delete
+            .eq("id", key_id)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return {"message": "API Key revoked successfully"}
+    except Exception as e:
+        logger.error(f"Error revoking API key {key_id} for user {user_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not revoke API key")
 
 # decision matrix
 ANALYSIS_MAP = {
@@ -415,7 +461,7 @@ ANALYSIS_MAP = {
     }
 }
 
-# jwt + api
+# jwt + key
 @app.post("/v1/analyze")
 async def analyze_image(
     request: Request,
@@ -638,13 +684,13 @@ async def analyze_image(
         logger.error(f"Analysis general error for request {request_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"request_id": request_id, "error": str(e)})
 
-# jwt + api
+# jwt
 @app.get("/history")
 async def get_history(
     auth = Depends(rate_limiter)
 ):
-    # Test modunda kayıt tutmadığımız için canlı verileri sızdırmamak adına boş döneriz.
-    if auth.get("is_test"): return []
+    if auth.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
 
     active_client_id = auth["id"]
 
@@ -667,6 +713,7 @@ class UserRegister(BaseModel):
     password: str
     account_type: str
 
+# will deprecated soon
 @app.post("/register", dependencies=[Depends(auth_rate_limiter)])
 def register(user: UserRegister):
     try:
@@ -700,6 +747,7 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+# will deprecated soon
 @app.post("/login", dependencies=[Depends(auth_rate_limiter)])
 def login(user: UserLogin):
     try:
@@ -723,16 +771,20 @@ def login(user: UserLogin):
     except Exception as e:
         logger.error(f"Login error for {user.email}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
-    
+
+# jwt
 @app.get("/me")
 async def get_me(auth = Depends(rate_limiter)):
+    if auth.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
+    
     user_id = auth["id"]
     profile = await asyncio.to_thread(
         lambda: supabase.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
     )
     return profile.data or {}
 
-# bir işlemden sonra lemon_squeezy buraya istek atar
+# ?
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
