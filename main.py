@@ -251,9 +251,16 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         # Veri (data) var mı? .data özelliği Supabase response'unda her zaman bulunur ama boşsa None döner.
         profile = getattr(profile_res, "data", None)
 
-        # Profil verisi yoksa veya is_allowed False ise erişimi kes
-        if not profile or not profile.get("is_allowed", False):
-            logger.warning(f"Access denied: Profile missing or not allowed for user {user_id}")
+        if not profile:
+            logger.error(f"Data Integrity Error: Authenticated user {user_id} has no profile entry!")
+            raise HTTPException(
+                status_code=404, 
+                detail={"error_code": "PROFILE_NOT_FOUND", "message": "Kullanıcı profili bulunamadı."}
+            )
+        
+        # waitlist check
+        if not profile.get("is_allowed", False):
+            logger.warning(f"Waitlist access denied: User {user_id} is waiting for approval.")
             raise HTTPException(
                 status_code=403, 
                 detail={"error_code": "WAITLIST_REQUIRED", "message": "Erişim izniniz bulunmuyor."}
