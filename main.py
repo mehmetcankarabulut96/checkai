@@ -505,39 +505,57 @@ async def analyze_image(
                 detail={"error": "Face detection service temporarily unavailable. No credits deducted."}
             )
 
+        # pre-checkpoint 1: if no human face
         if not is_human:
-            # Yüz yoksa API'ye gitme, sıfır değerleri ata
+            logger.info(f"No human face found - Request: {request_id}, User: {active_client_id}. No credits deducted.")
             decision = ANALYSIS_MAP["NO_HUMAN_FACE"]
-            genai_score = 0.0
-            deepfake_score = 0.0
-            provider_req_id = None
-        else:
-            # Yüz varsa Sightengine analizini yap
-            params = {
-                'models': 'genai,deepfake',
-                'api_user': SIGHTENGINE_USER,
-                'api_secret': SIGHTENGINE_SECRET
+            return {
+                "request_id": request_id,
+                "status": "success",
+                "results": {
+                    "verdict": {
+                        "action": decision["action"],
+                        "risk_level": decision["risk_level"],
+                        "label": decision["label"]
+                    },
+                    "summary": {
+                        "description": decision["description"],
+                        "recommendation": decision["recommendation"]
+                    },
+                    "scores": {"ai_generated": 0.0, "deepfake": 0.0}
+                },
+                "meta": {
+                    "credits_remaining": current_credits, # no credits used
+                    "processing_time_ms": int((time.time() - start_time) * 1000)
+                }
             }
-            files = {'media': (file.filename, content, file.content_type)}
 
-            response = await http_client.post(API_URL, data=params, files=files)
-            response.raise_for_status() 
-            result = response.json()
+        # sightengine
+        params = {
+            'models': 'genai,deepfake',
+            'api_user': SIGHTENGINE_USER,
+            'api_secret': SIGHTENGINE_SECRET
+        }
+        files = {'media': (file.filename, content, file.content_type)}
 
-            if result.get("status") != "success":
-                logger.error(f"Sightengine API error for request {request_id}: {result}")
-                raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
+        response = await http_client.post(API_URL, data=params, files=files)
+        response.raise_for_status() 
+        result = response.json()
 
-            genai_score = result.get("type", {}).get("ai_generated", 0)
-            deepfake_score = result.get("type", {}).get("deepfake", 0)
-            provider_req_id = result.get("request", {}).get("id")
+        if result.get("status") != "success":
+            logger.error(f"Sightengine API error for request {request_id}: {result}")
+            raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
 
-            # decision
-            if deepfake_score >= 0.80: decision = ANALYSIS_MAP["DEEPFAKE"]
-            elif genai_score >= 0.85: decision = ANALYSIS_MAP["SYNTHETIC"]
-            elif 0.50 <= genai_score < 0.85: decision = ANALYSIS_MAP["MODIFIED"]
-            elif 0.30 <= deepfake_score < 0.80 or 0.30 <= genai_score < 0.50: decision = ANALYSIS_MAP["INCONCLUSIVE"]
-            else: decision = ANALYSIS_MAP["AUTHENTIC"]
+        genai_score = result.get("type", {}).get("ai_generated", 0)
+        deepfake_score = result.get("type", {}).get("deepfake", 0)
+        provider_req_id = result.get("request", {}).get("id")
+
+        # decision
+        if deepfake_score >= 0.80: decision = ANALYSIS_MAP["DEEPFAKE"]
+        elif genai_score >= 0.85: decision = ANALYSIS_MAP["SYNTHETIC"]
+        elif 0.50 <= genai_score < 0.85: decision = ANALYSIS_MAP["MODIFIED"]
+        elif 0.30 <= deepfake_score < 0.80 or 0.30 <= genai_score < 0.50: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
         file_extension = file.filename.split(".")[-1]
