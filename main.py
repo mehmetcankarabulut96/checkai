@@ -522,6 +522,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "scores": {"ai_generated": 0.01,"deepfake": 0.01}
             },
             "meta": {
+                "credits_used": 0,
+                "credits_deducted": False,
                 "credits_remaining": "unlimited (test mode)",
                 "processing_time_ms": int((time.time() - start_time) * 1000)
             }
@@ -597,6 +599,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                     "scores": {"ai_generated": 0.0, "deepfake": 0.0}
                 },
                 "meta": {
+                    "credits_used": 0,
+                    "credits_deducted": False,
                     "credits_remaining": current_credits, # no credits used
                     "processing_time_ms": int((time.time() - start_time) * 1000)
                 }
@@ -702,6 +706,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 }
             },
             "meta": {
+                "credits_used": 1,
+                "credits_deducted": True,
                 "credits_remaining": new_credits,
                 "processing_time_ms": int((time.time() - start_time) * 1000)
             }
