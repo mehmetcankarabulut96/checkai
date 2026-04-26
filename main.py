@@ -220,9 +220,9 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         if result.data:
             user_id = result.data[0]["user_id"]
             auth_info = {"id": user_id, "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
-            logger.info(f"api-key accepted. key: {api_key} - hash: {hashed_key}")
+            logger.info(f"api-key accepted. key-hash: {hashed_key}")
         else:
-            logger.warning(f"Invalid or inactive API key attempt. key: {api_key} - hash: {hashed_key}")
+            logger.warning(f"Invalid or inactive API key attempt. key-hash: {hashed_key}")
             raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
     # JWT
     elif credentials:
