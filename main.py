@@ -507,6 +507,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "request_id": request_id,
             "status": "success",
             "results": {
+                "authenticity_score": 99.0,
                 "verdict": {"action": "ACCEPT","risk_level": "LOW","label": "AUTHENTIC"},
                 "summary": {
                     "description": "No synthetic face swap or fully AI-generated identity was detected (Test Mode).",
@@ -611,11 +612,15 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         deepfake_score = result.get("type", {}).get("deepfake", 0)
         provider_req_id = result.get("request", {}).get("id")
 
+        # calculate authenticity score
+        max_risk = max(genai_score, deepfake_score)
+        authenticity_score = round((1 - max_risk) * 100, 2)
+
         # decision
         if deepfake_score >= 0.80: decision = ANALYSIS_MAP["DEEPFAKE"]
         elif genai_score >= 0.85: decision = ANALYSIS_MAP["SYNTHETIC"]
-        elif 0.50 <= genai_score < 0.85: decision = ANALYSIS_MAP["MODIFIED"]
-        elif 0.30 <= deepfake_score < 0.80 or 0.30 <= genai_score < 0.50: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        elif genai_score >= 0.50: decision = ANALYSIS_MAP["MODIFIED"]
+        elif deepfake_score >= 0.30 or genai_score >= 0.30: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
@@ -631,6 +636,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "image_url": image_url,
             "genai_score": genai_score,
             "deepfake_score": deepfake_score,
+            "authenticity_score": authenticity_score,
             "risk_level": decision["risk_level"],
             "label": decision["label"],
             "action": decision["action"],
@@ -676,6 +682,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "request_id": request_id,
             "status": "success",
             "results": {
+                "authenticity_score": authenticity_score,
                 "verdict": {
                     "action": decision["action"],
                     "risk_level": decision["risk_level"],
