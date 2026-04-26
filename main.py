@@ -80,13 +80,6 @@ DEFAULT_BUSINESS_PACKAGE_MAX_LIVE_KEY_LIMIT = 20
 
 # decision matrix
 ANALYSIS_MAP = {
-    "NO_HUMAN_FACE": {
-        "label": "NO_HUMAN_FACE",
-        "action": "REJECT",
-        "risk_level": "LOW",
-        "description": "The system could not detect a clear human face in the image.",
-        "recommendation": "Please upload a clear profile photo containing a real human face."
-    },
     "DEEPFAKE": {
         "label": "DEEPFAKE_DETECTION",
         "action": "REJECT",
@@ -581,22 +574,14 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
 
         # pre-checkpoint 1: if no human face
         if not is_human:
-            logger.info(f"No human face found - Request: {request_id}, User: {active_client_id}. No credits deducted.")
-            decision = ANALYSIS_MAP["NO_HUMAN_FACE"]
+            logger.info(f"Pre-check failed: No human face - Request: {request_id}, User: {active_client_id}.")
             return {
                 "request_id": request_id,
-                "status": "success",
-                "results": {
-                    "verdict": {
-                        "action": decision["action"],
-                        "risk_level": decision["risk_level"],
-                        "label": decision["label"]
-                    },
-                    "summary": {
-                        "description": decision["description"],
-                        "recommendation": decision["recommendation"]
-                    },
-                    "scores": {"ai_generated": 0.0, "deepfake": 0.0}
+                "status": "failed",
+                "error": {
+                    "code": "FACE_NOT_DETECTED",
+                    "message": "Analysis could not be started: No valid human face found in the image.",
+                    "recommendation": "Please upload a photo with a clear human face."
                 },
                 "meta": {
                     "credits_used": 0,
