@@ -507,13 +507,13 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "request_id": request_id,
             "status": "success",
             "results": {
-                "authenticity_score": 99.0,
+                "authenticity_score": 99.00,
                 "verdict": {"action": "ACCEPT","risk_level": "LOW","label": "AUTHENTIC"},
                 "summary": {
                     "description": "No synthetic face swap or fully AI-generated identity was detected (Test Mode).",
                     "recommendation": "Meets identity verification standards. Acceptable."
                 },
-                "scores": {"ai_generated": 0.01,"deepfake": 0.01}
+                "scores": {"ai_generated": 1.00,"deepfake": 1.00}
             },
             "meta": {
                 "credits_used": 0,
@@ -608,19 +608,18 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             logger.error(f"Sightengine API error for request {request_id}: {result}")
             raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
 
-        genai_score = result.get("type", {}).get("ai_generated", 0)
-        deepfake_score = result.get("type", {}).get("deepfake", 0)
+        genai_score = round(result.get("type", {}).get("ai_generated", 0) * 100, 2)
+        deepfake_score = round(result.get("type", {}).get("deepfake", 0) * 100, 2)
         provider_req_id = result.get("request", {}).get("id")
 
         # calculate authenticity score
-        max_risk = max(genai_score, deepfake_score)
-        authenticity_score = round((1 - max_risk) * 100, 2)
+        authenticity_score = round(100.0 - max(genai_score, deepfake_score), 2)
 
         # decision
-        if deepfake_score >= 0.80: decision = ANALYSIS_MAP["DEEPFAKE"]
-        elif genai_score >= 0.85: decision = ANALYSIS_MAP["SYNTHETIC"]
-        elif genai_score >= 0.50: decision = ANALYSIS_MAP["MODIFIED"]
-        elif deepfake_score >= 0.30 or genai_score >= 0.30: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        if deepfake_score >= 80.0: decision = ANALYSIS_MAP["DEEPFAKE"]
+        elif genai_score >= 85.0: decision = ANALYSIS_MAP["SYNTHETIC"]
+        elif genai_score >= 50.0: decision = ANALYSIS_MAP["MODIFIED"]
+        elif deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
