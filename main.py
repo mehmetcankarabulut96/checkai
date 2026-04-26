@@ -740,7 +740,20 @@ async def get_history(auth = Depends(management_rate_limiter)):
                 .order("created_at", desc=True) \
                 .execute()
         )
-        return response.data
+
+        # VERİ ZENGİNLEŞTİRME: Her log kaydına güncel mesaj ve açıklamaları ekleyelim
+        enriched_data = []
+        for log in response.data:
+            # label üzerinden ANALYSIS_MAP'teki karşılığını buluyoruz
+            decision = next((val for val in ANALYSIS_MAP.values() if val["label"] == log.get("label")), None)
+            
+            if decision:
+                log["recommendation"] = decision["recommendation"]
+                log["description"] = decision["description"]
+            
+            enriched_data.append(log)
+
+        return enriched_data
     except Exception as e:
         logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
