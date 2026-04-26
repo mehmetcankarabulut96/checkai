@@ -741,19 +741,36 @@ async def get_history(auth = Depends(management_rate_limiter)):
                 .execute()
         )
 
-        # VERİ ZENGİNLEŞTİRME: Her log kaydına güncel mesaj ve açıklamaları ekleyelim
-        enriched_data = []
+        clean_history = []
         for log in response.data:
-            # label üzerinden ANALYSIS_MAP'teki karşılığını buluyoruz
+            # label üzerinden ANALYSIS_MAP'teki karşılığını bul
             decision = next((val for val in ANALYSIS_MAP.values() if val["label"] == log.get("label")), None)
             
-            if decision:
-                log["recommendation"] = decision["recommendation"]
-                log["description"] = decision["description"]
-            
-            enriched_data.append(log)
+            item = {
+                "id": log.get("id"),
+                "image_url": log.get("image_url"),
+                "authenticity_score": log.get("authenticity_score"),
+                "verdict": {
+                    "risk_level": log.get("risk_level"),
+                    "label": log.get("label")
+                },
+                "recommendation": {
+                    "action": log.get("action"),
+                    "message": decision["recommendation"]["message"] if decision else None
+                },
+                "summary": {
+                    "description": decision["description"] if decision else None
+                },
+                "scores": {
+                    "ai_generated": log.get("genai_score"),
+                    "deepfake": log.get("deepfake_score")
+                },
+                "user_request_id": log.get("user_request_id"),
+                "created_at": log.get("created_at")
+            }
+            clean_history.append(item)
 
-        return enriched_data
+        return clean_history
     except Exception as e:
         logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
