@@ -740,6 +740,7 @@ async def get_history(auth = Depends(management_rate_limiter)):
             lambda: supabase.table("analysis_history") \
                 .select("*") \
                 .eq("user_id", active_client_id) \
+                .is_("deleted_at", "null") \
                 .order("created_at", desc=True) \
                 .execute()
         )
@@ -752,6 +753,7 @@ async def get_history(auth = Depends(management_rate_limiter)):
             item = {
                 "id": log.get("id"),
                 "image_url": log.get("image_url"),
+                "purged_at": log.get("purged_at"),
                 "authenticity_score": log.get("authenticity_score"),
                 "verdict": {
                     "risk_level": log.get("risk_level"),
