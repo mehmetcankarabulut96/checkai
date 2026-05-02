@@ -537,7 +537,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         current_credits = profile_data.get("credits", 0)
         if current_credits <= 0:
             logger.warning(f"Insufficient credits for user: {active_client_id}")
-            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED,detail="Not enough credits, please do payment")
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Not enough credits, please do payment")
         
         # check daily limit
         await check_daily_limit(profile_data)
@@ -639,10 +639,12 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
-        file_extension = file.filename.split(".")[-1]
-        unique_filename = f"{uuid.uuid4()}.{file_extension}"
+        unique_filename = f"{uuid.uuid4()}{file_ext}"
         file_path = f"{active_client_id}/{unique_filename}"
-        supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
+        await asyncio.to_thread(
+            lambda: supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
+        )
+        # TODO use create_signed_url instead get_public_url
         image_url = supabase.storage.from_("images").get_public_url(file_path)
 
         # db insert
@@ -719,9 +721,11 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "processing_time_ms": int((time.time() - start_time) * 1000)
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Analysis general error for request {request_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"request_id": request_id, "error": str(e)})
+        raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Internal server error."})
 
 # jwt
 @app.get("/history")
