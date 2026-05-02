@@ -507,40 +507,6 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
     request_id = f"req_{uuid.uuid4().hex[:12]}"
     start_time = time.time()
 
-    # ---- TEST MODE ----
-    if is_test_mode:
-        # gerçekçi analiz süresi simülasyonu
-        await asyncio.sleep(1.2)
-        test_decision = ANALYSIS_MAP["AUTHENTIC"]
-
-        logger.info(f"Test analysis successful - Request: {request_id}, User: {active_client_id}")
-        return {
-            "request_id": request_id,
-            "status": "success",
-            "results": {
-                "authenticity_score": 99.00,
-                "verdict": {
-                    "risk_level": test_decision["risk_level"],
-                    "label": test_decision["label"]
-                },
-                "recommendation": test_decision["recommendation"],
-                "summary": {
-                    "description": test_decision["description"]
-                },
-                "scores": {
-                    "ai_generated": 1.00,
-                    "deepfake": 1.00
-                }
-            },
-            "meta": {
-                "credits_used": 0,
-                "credits_deducted": False,
-                "credits_remaining": 0,
-                "mode": "test",
-                "processing_time_ms": int((time.time() - start_time) * 1000)
-            }
-        }
-
     # file extension check
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in ALLOWED_EXTENSIONS:
@@ -566,18 +532,15 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             detail=f"file is too small: min size is {MIN_FILE_SIZE}KB"
         )
 
-    # check credits
-    current_credits = profile_data.get("credits", 0)
-
-    if current_credits <= 0:
-        logger.warning(f"Insufficient credits for user: {active_client_id}")
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail="Not enough credits, please do payment"
-        )
-    
-    # --- GÜNLÜK LİMİT KONTROLÜ ---
-    await check_daily_limit(profile_data)
+    if not is_test_mode:
+        # check credits
+        current_credits = profile_data.get("credits", 0)
+        if current_credits <= 0:
+            logger.warning(f"Insufficient credits for user: {active_client_id}")
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED,detail="Not enough credits, please do payment")
+        
+        # check daily limit
+        await check_daily_limit(profile_data)
 
     try:
         content = await file.read()
@@ -591,7 +554,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 detail={"error": "Face detection service temporarily unavailable. No credits deducted."}
             )
 
-        # pre-checkpoint 1: if no human face
+        # checkpoint 1: a human face check
         if not is_human:
             logger.info(f"Pre-check failed: No human face - Request: {request_id}, User: {active_client_id}.")
             return {
@@ -605,8 +568,42 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "meta": {
                     "credits_used": 0,
                     "credits_deducted": False,
-                    "credits_remaining": current_credits, # no credits used
-                    "mode": "live",
+                    "credits_remaining": profile_data.get("credits", 0), # no credits used
+                    "mode": "test" if is_test_mode else "live",
+                    "processing_time_ms": int((time.time() - start_time) * 1000)
+                }
+            }
+
+        # ---- TEST MODE ----
+        if is_test_mode:
+            # gerçekçi analiz süresi simülasyonu
+            await asyncio.sleep(1.2)
+            test_decision = ANALYSIS_MAP["AUTHENTIC"]
+
+            logger.info(f"Test analysis successful - Request: {request_id}, User: {active_client_id}")
+            return {
+                "request_id": request_id,
+                "status": "success",
+                "results": {
+                    "authenticity_score": 99.00,
+                    "verdict": {
+                        "risk_level": test_decision["risk_level"],
+                        "label": test_decision["label"]
+                    },
+                    "recommendation": test_decision["recommendation"],
+                    "summary": {
+                        "description": test_decision["description"]
+                    },
+                    "scores": {
+                        "ai_generated": 1.00,
+                        "deepfake": 1.00
+                    }
+                },
+                "meta": {
+                    "credits_used": 0,
+                    "credits_deducted": False,
+                    "credits_remaining": 0,
+                    "mode": "test",
                     "processing_time_ms": int((time.time() - start_time) * 1000)
                 }
             }
