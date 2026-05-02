@@ -784,6 +784,62 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str
 
+# jwt
+@app.delete("/history/{analysis_id}/image")
+async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate_limiter)):
+    active_client_id = auth["id"]
+    
+    try:
+        # Kaydı bul ve sahipliği kontrol et
+        res = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .select("image_url, user_id")
+            .eq("id", analysis_id)
+            .eq("user_id", active_client_id)
+            .execute()
+        )
+        
+        if not res or not getattr(res, "data", []):
+            raise HTTPException(status_code=404, detail="Analysis record not found.")
+            
+        log = res.data[0]
+        
+        if not log.get("image_url"):
+            return {"status": "ignored", "message": "Image already deleted."}
+
+        # URL'den Storage dosya yolunu ayıkla
+        try:
+            image_url = log["image_url"]
+            file_path = image_url.split("/images/")[1]
+        except Exception:
+            logger.error(f"Malformed image URL for analysis {analysis_id}: {image_url}")
+            raise HTTPException(status_code=500, detail="Could not parse image path.")
+
+        # Storage'dan dosyayı fiziksel olarak sil
+        await asyncio.to_thread(
+            lambda: supabase.storage.from_("images").remove([file_path])
+        )
+        
+        # SADECE image_url'i null yap, purged_at Cron Job'a bırakıldı
+        await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .update({"image_url": None})
+            .eq("id", analysis_id)
+            .execute()
+        )
+
+        logger.info(f"Image manually deleted from storage for analysis {analysis_id} by user {active_client_id}")
+        return {
+            "status": "success", 
+            "message": "Image permanently deleted from storage."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during manual image deletion for analysis {analysis_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal error occurred during deletion.")
+
 # will deprecated soon
 @app.post("/register", dependencies=[Depends(auth_rate_limiter)])
 def register(user: UserRegister):
