@@ -780,13 +780,67 @@ async def get_history(auth = Depends(management_rate_limiter)):
         logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-class UserRegister(BaseModel):
-    email: EmailStr
-    password: str
+# jwt
+@app.delete("/history/{analysis_id}")
+async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_limiter)):
+    if auth.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot delete history. Please use jwt access.")
+    
+    active_client_id = auth["id"]
+    
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .select("image_url")
+            .eq("id", analysis_id)
+            .eq("user_id", active_client_id)
+            .execute()
+        )
+        
+        if not res or not getattr(res, "data", []):
+            raise HTTPException(status_code=404, detail="Analysis record not found.")
+            
+        log = res.data[0]
+        image_url = log.get("image_url")
+
+        if image_url:
+            try:
+                file_path = image_url.split("/images/")[1]
+                await asyncio.to_thread(
+                    lambda: supabase.storage.from_("images").remove([file_path])
+                )
+            except Exception as e:
+                logger.error(f"Physical image deletion failed for {analysis_id}: {str(e)}")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            lambda: supabase.table("analysis_history")
+            .update({
+                "image_url": None,
+                "deleted_at": now_iso
+            })
+            .eq("id", analysis_id)
+            .execute()
+        )
+
+        logger.info(f"Full analysis soft-deleted: {analysis_id} by user {active_client_id}")
+        return {
+            "status": "success", 
+            "message": "Analysis record and associated image have been removed."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during full analysis deletion: {analysis_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during deletion.")
 
 # jwt
 @app.delete("/history/{analysis_id}/image")
 async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate_limiter)):
+    if auth.get("auth_type") == "api_key":
+        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
+    
     active_client_id = auth["id"]
     
     try:
@@ -803,7 +857,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
             raise HTTPException(status_code=404, detail="Analysis record not found.")
             
         log = res.data[0]
-        
+
         if not log.get("image_url"):
             return {"status": "ignored", "message": "Image already deleted."}
 
@@ -819,7 +873,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
         await asyncio.to_thread(
             lambda: supabase.storage.from_("images").remove([file_path])
         )
-        
+
         # SADECE image_url'i null yap, purged_at Cron Job'a bırakıldı
         await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
@@ -839,6 +893,10 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
     except Exception as e:
         logger.error(f"Error during manual image deletion for analysis {analysis_id}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred during deletion.")
+
+class UserRegister(BaseModel):
+    email: EmailStr
+    password: str
 
 # will deprecated soon
 @app.post("/register", dependencies=[Depends(auth_rate_limiter)])
