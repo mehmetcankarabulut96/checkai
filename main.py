@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -12,13 +12,7 @@ from starlette.requests import Request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from datetime import datetime, timezone
-
-# logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from openai import AsyncOpenAI
 
 # security
 MIN_FILE_SIZE = 50 * 1024 # 50 KB (trash)
@@ -80,6 +74,15 @@ DEFAULT_BUSINESS_PACKAGE_MAX_LIVE_KEY_LIMIT = 20
 
 # decision matrix
 ANALYSIS_MAP = {
+    "SEMANTIC_ANOMALY": {
+        "label": "SEMANTIC_ANOMALY_DETECTION",
+        "risk_level": "HIGH",
+        "description": "Biological or logical inconsistencies (e.g., impossible hybrids or structural anomalies) detected in the content.",
+        "recommendation": {
+            "action": "REJECT",
+            "message": "High security risk. The content contains logical or biological anomalies that do not exist in reality. Rejection is strongly recommended."
+        }
+    },
     "DEEPFAKE": {
         "label": "DEEPFAKE_DETECTION",
         "risk_level": "HIGH",
@@ -127,9 +130,49 @@ ANALYSIS_MAP = {
     }
 }
 
+VLM_EXPLANATION_MAP = {
+    # BIOLOGICAL_ANOMALY (Biyolojik Anomali):
+    # - İnsan anatomisine aykırı durumlar (Örn: 6 parmaklı eller, asimetrik göz bebekleri).
+    # - Türler arası imkansız melezler (Örn: Kedi kafasına sahip insan vücudu).
+    # - Fizyolojik olarak imkansız vücut duruşları veya eksik/fazla uzuvlar.
+    "BIOLOGICAL_ANOMALY": "improper biological structures",
+
+    # PHYSICAL_INCONSISTENCY (Fiziksel Tutarsızlık):
+    # - Işık ve gölge hataları (Örn: Işık sağdan vururken gölgenin sağa düşmesi).
+    # - Yerçekimine veya fizik kurallarına aykırı duran objeler (Örn: Havada asılı kalan veya yüzeye temas etmeyen eşyalar).
+    # - Aynadaki yansımanın kişiyle veya ortamla uyuşmaması.
+    "PHYSICAL_INCONSISTENCY": "inconsistent lighting and shadow perspectives",
+
+    # DELIBERATE_OBSCURATION (Kasten Gizleme/Bulanıklaştırma):
+    # - Bir manipülasyonu (Photoshop hatasını veya AI izini) saklamak için fotoğrafın belli bir yerine kasten eklenmiş aşırı kirlilik (noise) veya bulanıklık (blur).
+    # - Yüzün veya kimlik kartı gibi kritik bölgelerin üzerine "yanlışlıkla" düşmüş gibi duran ama aslında iz kapatan büyük piksellenmeler.     
+    "DELIBERATE_OBSCURATION": "deliberate obscuration or masking of details",
+
+    # CONTEXTUAL_MISMATCH (Bağlamsal Uyumsuzluk):
+    # - Fotoğraftaki ana obje ile arka planın uyumsuzluğu (Örn: Kışlık kalın bir mont giyen kişinin arkasında yazlık güneşli bir kumsal olması).
+    # - Objelerin birbirine göre orantısız büyüklükte olması (Örn: Bir kedinin arka plandaki arabadan daha büyük görünmesi).
+    # - Arka planın kes-yapıştır (crop) yapıldığını belli eden keskin kenar izleri.  
+    "CONTEXTUAL_MISMATCH": "contextual mismatch between subjects and background",
+
+    # SYNTHETIC_ARTIFACTS (Sentetik Kalıntılar/İzler):
+    # - Midjourney, DALL-E gibi yapay zeka modellerinin sıklıkla yaptığı tipik doku (texture) hataları.
+    # - Anlamsız erimiş yazılar (AI genelde metinleri doğru üretemez ve harfler birbirine girer).
+    # - Saç tellerinin cilde veya kıyafete doğal olmayan bir şekilde yapışıp "erimiş" gibi durması.
+    "SYNTHETIC_ARTIFACTS": "AI-specific texture artifacts and hallucinations"
+}
+
 app = FastAPI(title="checkai b2b api", version="1.0.0")
 
 load_dotenv()
+
+# logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # cors
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -170,6 +213,82 @@ try:
 except Exception as e:
     logger.critical(f"FATAL: MediaPipe model could not be loaded: {e}")
     raise RuntimeError(f"Model load failure: {e}")
+
+async def call_vlm(image_content: bytes) -> dict:
+    """
+        GPT-4o (veya Vision destekli başka bir model) kullanarak gerçek VLM analizi yapar.
+        Sadece istenen JSON formatında yanıt dönmeye zorlanmıştır.
+    """
+    # 1. Byte verisini Base64'e çevir
+    base64_image = base64.b64encode(image_content).decode('utf-8')
+    
+    # 2. VLM için katı kurallı System Prompt
+    system_prompt = """
+    You are an expert forensic image analysis AI. Your task is to detect semantic and logical anomalies that indicate an image is a deepfake or AI-generated.
+    Score the following 5 categories from 0.0 (perfectly authentic) to 100.0 (definitely anomalous/fake).
+    You MUST return ONLY a valid JSON object with exact following keys and float values:
+    {
+        "biological_anomaly": float,
+        "physical_inconsistency": float,
+        "deliberate_obscuration": float,
+        "contextual_mismatch": float,
+        "synthetic_artifacts": float
+    }
+    """
+
+    try:
+        # 3. Asenkron API Çağrısı (response_format ile JSON garantisi)
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini", # Maliyet/Hız optimizasyonu için mini veya gpt-4o kullanabilirsin
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}",
+                            "detail": "high" # Yüksek çözünürlüklü analiz için
+                        }
+                    }
+                ]}
+            ],
+            max_tokens=200,
+            temperature=0.0 # Sabit ve tutarlı skorlar için 0 (sıfır) olmalı
+        )
+        
+        # response
+        usage = response.usage # prompt_tokens, completion_tokens, total_tokens içerir
+        raw_json = response.choices[0].message.content
+        sub_details = json.loads(raw_json)
+        
+    except Exception as e:
+        logger.error(f"VLM API Call failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "error_code": "VLM_ANALYSIS_FAILED",
+                "message": "Semantic analysis engine is temporarily unavailable."
+            }
+        )
+
+    # filtreleme ve etiketleme mantığı
+    reasons = [key.upper() for key, score in sub_details.items() if float(score) >= 80.0]
+    total_score = max([float(v) for v in sub_details.values()])
+    
+    if not reasons:
+        explanation = "No significant semantic anomalies detected. The image appears logically consistent."
+    else:
+        explanation_parts = [VLM_EXPLANATION_MAP[reason] for reason in reasons if reason in VLM_EXPLANATION_MAP]
+        explanation = f"Analysis detected {', '.join(explanation_parts)}. These findings suggest a lack of semantic authenticity."
+
+    return {
+        "total_anomaly_score": total_score,
+        "anomaly_reasons": reasons,
+        "anomaly_explanation": explanation,
+        "details": sub_details,
+        "tokens_used": usage.total_tokens
+    }
 
 async def has_human_face(image_bytes: bytes) -> bool:
     """
@@ -591,12 +710,15 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                         "label": test_decision["label"]
                     },
                     "recommendation": test_decision["recommendation"],
-                    "summary": {
-                        "description": test_decision["description"]
+                    "explanation": test_decision["description"],
+                    "semantic_details": {
+                        "semantic_anomaly_reasons": [],
+                        "semantic_anomaly_breakdown": None
                     },
                     "scores": {
                         "ai_generated": 1.00,
-                        "deepfake": 1.00
+                        "deepfake": 1.00,
+                        "semantic_anomaly": 0.00
                     }
                 },
                 "meta": {
@@ -623,19 +745,37 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         if result.get("status") != "success":
             logger.error(f"Sightengine API error for request {request_id}: {result}")
             raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
+        provider_req_id = result.get("request", {}).get("id")
 
         genai_score = round(result.get("type", {}).get("ai_generated", 0) * 100, 2)
         deepfake_score = round(result.get("type", {}).get("deepfake", 0) * 100, 2)
-        provider_req_id = result.get("request", {}).get("id")
+
+        # semantic layer with vlm
+        semantic_anomaly_score = 0.00
+        semantic_anomaly_reasons = []
+        semantic_anomaly_explanation = None
+        semantic_anomaly_details = None
+        vlm_tokens_used = 0
+        if genai_score < 85.0 and deepfake_score < 80.0:
+            vlm_response = await call_vlm(content)
+            semantic_anomaly_score = vlm_response["total_anomaly_score"]
+            semantic_anomaly_reasons = vlm_response["anomaly_reasons"]
+            semantic_anomaly_explanation = vlm_response["anomaly_explanation"]
+            semantic_anomaly_details = vlm_response["details"]
+            vlm_tokens_used = vlm_response.get("tokens_used", 0)
+            logger.info(f"VLM Analysis completed for {request_id}. Score: {semantic_anomaly_score}")
+        else:
+            logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
 
         # calculate authenticity score
-        authenticity_score = round(100.0 - max(genai_score, deepfake_score), 2)
+        authenticity_score = round(100.0 - max(genai_score, deepfake_score, semantic_anomaly_score), 2)
 
         # decision
-        if deepfake_score >= 80.0: decision = ANALYSIS_MAP["DEEPFAKE"]
+        if semantic_anomaly_score >= 80.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
+        elif deepfake_score >= 80.0: decision = ANALYSIS_MAP["DEEPFAKE"]
         elif genai_score >= 85.0: decision = ANALYSIS_MAP["SYNTHETIC"]
         elif genai_score >= 50.0: decision = ANALYSIS_MAP["MODIFIED"]
-        elif deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        elif semantic_anomaly_score >= 40.0 or deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
@@ -654,6 +794,10 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "genai_score": genai_score,
             "deepfake_score": deepfake_score,
             "authenticity_score": authenticity_score,
+            "semantic_anomaly_score": semantic_anomaly_score,
+            "semantic_anomaly_details": semantic_anomaly_details,
+            "semantic_anomaly_explanation": semantic_anomaly_explanation,
+            "vlm_tokens_used": vlm_tokens_used,
             "risk_level": decision["risk_level"],
             "label": decision["label"],
             "action": decision["recommendation"]["action"],
@@ -705,12 +849,15 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                     "label": decision["label"]
                 },
                 "recommendation": decision["recommendation"],
-                "summary": {
-                    "description": decision["description"]
+                "explanation": semantic_anomaly_explanation or decision["description"],
+                "semantic_details": {
+                    "semantic_anomaly_reasons": semantic_anomaly_reasons,
+                    "semantic_anomaly_breakdown": semantic_anomaly_details
                 },
                 "scores": {
                     "ai_generated": genai_score,
-                    "deepfake": deepfake_score
+                    "deepfake": deepfake_score,
+                    "semantic_anomaly": semantic_anomaly_score
                 }
             },
             "meta": {
@@ -764,12 +911,15 @@ async def get_history(auth = Depends(management_rate_limiter)):
                     "action": log.get("action"),
                     "message": decision["recommendation"]["message"] if decision else None
                 },
-                "summary": {
-                    "description": decision["description"] if decision else None
+                "explanation": log.get("semantic_anomaly_explanation") or (decision["description"] if decision else None),
+                "semantic_details": {
+                    "semantic_anomaly_reasons": [k.upper() for k, v in (log.get("semantic_anomaly_details") or {}).items() if v >= 80.0] if log.get("semantic_anomaly_details") else [],
+                    "semantic_anomaly_breakdown": log.get("semantic_anomaly_details")
                 },
                 "scores": {
                     "ai_generated": log.get("genai_score"),
-                    "deepfake": log.get("deepfake_score")
+                    "deepfake": log.get("deepfake_score"),
+                    "semantic_anomaly": log.get("semantic_anomaly_score")
                 },
                 "user_request_id": log.get("user_request_id"),
                 "created_at": log.get("created_at")
