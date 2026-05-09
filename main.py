@@ -753,8 +753,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         deepfake_score = round(result.get("type", {}).get("deepfake", 0) * 100, 2)
 
         # semantic layer with vlm
-        semantic_anomaly_score = 0.00
-        semantic_anomaly_reasons = []
+        semantic_anomaly_score = None
+        semantic_anomaly_reasons = None
         semantic_anomaly_explanation = None
         semantic_anomaly_details = None
 
@@ -777,8 +777,11 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         else:
             logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
 
+        # Eğer VLM çalışmadıysa hesaplamada 0.0 olarak kabul et (matematiğin çökmemesi için)
+        safe_semantic_score = semantic_anomaly_score if semantic_anomaly_score is not None else 0.0
+
         # calculate authenticity score
-        authenticity_score = round(100.0 - max(genai_score, deepfake_score, semantic_anomaly_score), 2)
+        authenticity_score = round(100.0 - max(genai_score, deepfake_score, safe_semantic_score), 2)
 
         # decision
         if semantic_anomaly_score >= 80.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
@@ -912,7 +915,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "semantic_details": {
                     "semantic_anomaly_reasons": semantic_anomaly_reasons,
                     "semantic_anomaly_breakdown": semantic_anomaly_details
-                },
+                } if semantic_anomaly_score is not None else None,
                 "scores": {
                     "ai_generated": genai_score,
                     "deepfake": deepfake_score,
@@ -972,9 +975,9 @@ async def get_history(auth = Depends(management_rate_limiter)):
                 },
                 "explanation": log.get("semantic_anomaly_explanation") or (decision["description"] if decision else None),
                 "semantic_details": {
-                    "semantic_anomaly_reasons": [k.upper() for k, v in (log.get("semantic_anomaly_details") or {}).items() if v >= 80.0] if log.get("semantic_anomaly_details") else [],
+                    "semantic_anomaly_reasons": [k.upper() for k, v in log.get("semantic_anomaly_details").items() if v >= 80.0],
                     "semantic_anomaly_breakdown": log.get("semantic_anomaly_details")
-                },
+                } if log.get("semantic_anomaly_details") else None,
                 "scores": {
                     "ai_generated": log.get("genai_score"),
                     "deepfake": log.get("deepfake_score"),
