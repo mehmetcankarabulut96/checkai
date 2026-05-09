@@ -287,7 +287,9 @@ async def call_vlm(image_content: bytes) -> dict:
         "anomaly_reasons": reasons,
         "anomaly_explanation": explanation,
         "details": sub_details,
-        "tokens_used": usage.total_tokens
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "openai_request_id": response.id
     }
 
 async def has_human_face(image_bytes: bytes) -> bool:
@@ -755,14 +757,22 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         semantic_anomaly_reasons = []
         semantic_anomaly_explanation = None
         semantic_anomaly_details = None
-        vlm_tokens_used = 0
+
+        vlm_prompt_tokens = 0
+        vlm_completion_tokens = 0
+        openai_request_id = None
+
         if genai_score < 85.0 and deepfake_score < 80.0:
             vlm_response = await call_vlm(content)
             semantic_anomaly_score = vlm_response["total_anomaly_score"]
             semantic_anomaly_reasons = vlm_response["anomaly_reasons"]
             semantic_anomaly_explanation = vlm_response["anomaly_explanation"]
             semantic_anomaly_details = vlm_response["details"]
-            vlm_tokens_used = vlm_response.get("tokens_used", 0)
+            
+            vlm_prompt_tokens = vlm_response.get("prompt_tokens", 0)
+            vlm_completion_tokens = vlm_response.get("completion_tokens", 0)
+            openai_request_id = vlm_response.get("openai_request_id")
+
             logger.info(f"VLM Analysis completed for {request_id}. Score: {semantic_anomaly_score}")
         else:
             logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
@@ -797,12 +807,12 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "semantic_anomaly_score": semantic_anomaly_score,
             "semantic_anomaly_details": semantic_anomaly_details,
             "semantic_anomaly_explanation": semantic_anomaly_explanation,
-            "vlm_tokens_used": vlm_tokens_used,
             "risk_level": decision["risk_level"],
             "label": decision["label"],
             "action": decision["recommendation"]["action"],
             "user_request_id": request_id,
-            "provider_request_id": provider_req_id
+            "provider_request_id": provider_req_id,
+            "vlm_request_id": openai_request_id
         }
         try:
             db_insert_response = await asyncio.to_thread(
@@ -821,6 +831,55 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
             except: pass
             raise HTTPException(status_code=500, detail="Database connection error.")
+
+        # --- BILLING LOGS (FİNANSAL TABLO EKLENTİSİ) ---
+        try:
+            # 1. Config'den Fiyatları Çek
+            pricing_res = await asyncio.to_thread(
+                lambda: supabase.table("pricing_config").select("*").execute()
+            )
+            pricing_data = {row["model_id"]: row for row in pricing_res.data}
+            gpt = pricing_data.get("gpt-4o-mini", {"input_unit_price": -1, "output_unit_price": -1, "unit_size": 1000000, "unit_type": "token"})
+            se = pricing_data.get("sightengine_check_v1", {"input_unit_price": -1, "output_unit_price": -1, "unit_size": 1, "unit_type": "operation"})
+
+            # 2. VLM Maliyet Hesaplama
+            vlm_in_cost = (vlm_prompt_tokens / float(gpt["unit_size"])) * float(gpt["input_unit_price"])
+            vlm_out_cost = (vlm_completion_tokens / float(gpt["unit_size"])) * float(gpt["output_unit_price"])
+
+            # 3. Sightengine Maliyet Hesaplama
+            se_ops = 10 # genai(5) + deepfake(5)
+            se_cost = (se_ops / float(se["unit_size"])) * float(se["input_unit_price"])
+
+            # 4. Toplam Maliyet
+            total_analysis_cost = vlm_in_cost + vlm_out_cost + se_cost
+
+            # 5. insert billing log
+            billing_data = {
+                "analysis_id": history_id,
+                
+                # VLM Detayları
+                "vlm_input_amount_consumed": vlm_prompt_tokens,
+                "vlm_output_amount_consumed": vlm_completion_tokens,
+                "vlm_input_unit_price": float(gpt["input_unit_price"]),
+                "vlm_output_unit_price": float(gpt["output_unit_price"]),
+                "vlm_unit_size": int(gpt["unit_size"]),
+                "vlm_unit_type": gpt["unit_type"],
+                "vlm_input_cost": round(vlm_in_cost, 6),
+                "vlm_output_cost": round(vlm_out_cost, 6),
+                
+                # Sightengine Detayları
+                "se_amount_consumed": se_ops,
+                "se_unit_price": float(se["input_unit_price"]),
+                "se_unit_size": int(se["unit_size"]),
+                "se_unit_type": se["unit_type"],
+                "se_total_cost": round(se_cost, 6),
+                
+                "analysis_total_cost": round(total_analysis_cost, 6)
+            }
+            
+            await asyncio.to_thread(lambda: supabase.table("billing_logs").insert(billing_data).execute())
+        except Exception as b_err:
+            logger.error(f"CRITICAL: Billing logging failed for analysis {history_id}: {str(b_err)}")
 
         # güvenli kredi düşme ve günlük sayaç artırma
         try:
