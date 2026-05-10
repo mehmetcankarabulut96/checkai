@@ -135,13 +135,13 @@ VLM_EXPLANATION_MAP = {
     # - İnsan anatomisine aykırı durumlar (Örn: 6 parmaklı eller, asimetrik göz bebekleri).
     # - Türler arası imkansız melezler (Örn: Kedi kafasına sahip insan vücudu).
     # - Fizyolojik olarak imkansız vücut duruşları veya eksik/fazla uzuvlar.
-    "BIOLOGICAL_ANOMALY": "improper biological structures",
+    "BIOLOGICAL_ANOMALY": "anatomical impossibilities or improper biological structures",
 
     # PHYSICAL_INCONSISTENCY (Fiziksel Tutarsızlık):
     # - Işık ve gölge hataları (Örn: Işık sağdan vururken gölgenin sağa düşmesi).
     # - Yerçekimine veya fizik kurallarına aykırı duran objeler (Örn: Havada asılı kalan veya yüzeye temas etmeyen eşyalar).
     # - Aynadaki yansımanın kişiyle veya ortamla uyuşmaması.
-    "PHYSICAL_INCONSISTENCY": "inconsistent lighting and shadow perspectives",
+    "PHYSICAL_INCONSISTENCY": "physical inconsistencies such as gravity, lighting, or reflection errors",
 
     # DELIBERATE_OBSCURATION (Kasten Gizleme/Bulanıklaştırma):
     # - Bir manipülasyonu (Photoshop hatasını veya AI izini) saklamak için fotoğrafın belli bir yerine kasten eklenmiş aşırı kirlilik (noise) veya bulanıklık (blur).
@@ -152,7 +152,7 @@ VLM_EXPLANATION_MAP = {
     # - Fotoğraftaki ana obje ile arka planın uyumsuzluğu (Örn: Kışlık kalın bir mont giyen kişinin arkasında yazlık güneşli bir kumsal olması).
     # - Objelerin birbirine göre orantısız büyüklükte olması (Örn: Bir kedinin arka plandaki arabadan daha büyük görünmesi).
     # - Arka planın kes-yapıştır (crop) yapıldığını belli eden keskin kenar izleri.  
-    "CONTEXTUAL_MISMATCH": "contextual mismatch between subjects and background",
+    "CONTEXTUAL_MISMATCH": "contextual or proportional mismatches between subjects and the background",
 
     # SYNTHETIC_ARTIFACTS (Sentetik Kalıntılar/İzler):
     # - Midjourney, DALL-E gibi yapay zeka modellerinin sıklıkla yaptığı tipik doku (texture) hataları.
