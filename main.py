@@ -782,18 +782,16 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         else:
             logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
 
-        # Eğer VLM çalışmadıysa hesaplamada 0.0 olarak kabul et (matematiğin çökmemesi için)
-        safe_semantic_score = semantic_anomaly_score if semantic_anomaly_score is not None else 0.0
-
         # calculate authenticity score
+        safe_semantic_score = semantic_anomaly_score if semantic_anomaly_score is not None else 0.0
         authenticity_score = round(100.0 - max(genai_score, deepfake_score, safe_semantic_score), 2)
 
         # decision
-        if semantic_anomaly_score >= 80.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
+        if safe_semantic_score >= 80.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
         elif deepfake_score >= 80.0: decision = ANALYSIS_MAP["DEEPFAKE"]
         elif genai_score >= 85.0: decision = ANALYSIS_MAP["SYNTHETIC"]
         elif genai_score >= 50.0: decision = ANALYSIS_MAP["MODIFIED"]
-        elif semantic_anomaly_score >= 40.0 or deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        elif safe_semantic_score >= 40.0 or deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
@@ -802,8 +800,19 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         await asyncio.to_thread(
             lambda: supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
         )
-        # TODO use create_signed_url instead get_public_url
-        image_url = supabase.storage.from_("images").get_public_url(file_path)
+
+        # create signed url
+        try:
+            signed_url_res = await asyncio.to_thread(
+                lambda: supabase.storage.from_("images").create_signed_url(file_path, expires_in=3600)
+            )
+            # Supabase kütüphane versiyonuna göre 'signedURL' veya 'signed_url' dönebilir
+            image_url = signed_url_res.get("signedURL") or signed_url_res.get("signed_url")
+            if not image_url:
+                raise Exception("Signed URL generation returned empty.")
+        except Exception as url_err:
+            logger.error(f"Unexpected error occurred while generating signed URL for {request_id}: {str(url_err)}")
+            raise HTTPException(status_code=500, detail={"code": "URL_GENERATION_ERROR", "message": "Secure image access could not be generated."})
 
         # db insert
         db_data = {
