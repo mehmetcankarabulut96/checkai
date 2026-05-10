@@ -267,7 +267,7 @@ async def call_vlm(image_content: bytes) -> dict:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
-                "error_code": "VLM_ANALYSIS_FAILED",
+                "code": "VLM_ANALYSIS_FAILED",
                 "message": "Semantic analysis engine is temporarily unavailable."
             }
         )
@@ -347,7 +347,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             logger.info(f"api-key accepted. key-hash: {hashed_key}")
         else:
             logger.warning(f"Invalid or inactive API key attempt. key-hash: {hashed_key}")
-            raise HTTPException(status_code=401, detail={"error_code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
+            raise HTTPException(status_code=401, detail={"code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
     # JWT
     elif credentials:
         try:
@@ -359,7 +359,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             logger.info(f"jwt accepted: user: {user_id}")
         except Exception as e:
             logger.warning(f"Invalid JWT attempt: {str(e)}")
-            raise HTTPException(status_code=401, detail={"error_code": "INVALID_JWT", "message": "Invalid or expired token."})
+            raise HTTPException(status_code=401, detail={"code": "INVALID_JWT", "message": "Invalid or expired token."})
     
     if user_id:
         # tüm profil verisi burada çekilip endpointlere dağıtılıyor
@@ -369,7 +369,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         # profile_res objesi var mı ve hata içermiyor mu?
         if not profile_res or hasattr(profile_res, "error") and profile_res.error:
             logger.error(f"Supabase connection error for user {user_id}")
-            raise HTTPException(status_code=500, detail="Database connection failed.")
+            raise HTTPException(status_code=500, detail={"code": "DATABASE_ERROR", "message": "Database connection failed."})
         
         # Veri (data) var mı? .data özelliği Supabase response'unda her zaman bulunur ama boşsa None döner.
         profile = getattr(profile_res, "data", None)
@@ -378,7 +378,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             logger.error(f"Data Integrity Error: Authenticated user {user_id} has no profile entry!")
             raise HTTPException(
                 status_code=404, 
-                detail={"error_code": "PROFILE_NOT_FOUND", "message": "Kullanıcı profili bulunamadı."}
+                detail={"code": "PROFILE_NOT_FOUND", "message": "User profile not found."}
             )
         
         # waitlist check
@@ -386,7 +386,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             logger.warning(f"Waitlist access denied: User {user_id} is waiting for approval.")
             raise HTTPException(
                 status_code=403, 
-                detail={"error_code": "WAITLIST_REQUIRED", "message": "Erişim izniniz bulunmuyor."}
+                detail={"code": "WAITLIST_REQUIRED", "message": "You do not have access permissions yet."}
             )
         
         auth_info["profile"] = profile
@@ -394,7 +394,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
 
     # unauthorized
     logger.warning("Unauthorized API access attempt.")
-    raise HTTPException(status_code=401, detail={"error_code": "UNAUTHORIZED", "message": "unauthorized."})
+    raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "Unauthorized request."})
 
 # register ve login endpointleri için limiter
 async def auth_rate_limiter(request: Request):
@@ -411,7 +411,7 @@ async def auth_rate_limiter(request: Request):
             logger.warning(f"IP based rate limit exceeded for: {ip}")
             raise HTTPException(
                 status_code=429, 
-                detail="Too many attempts. Please try again in a minute."
+                detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many attempts. Please try again in a minute."}
             )
             
         AUTH_RATE_LIMIT_STORAGE[ip].append(now)
@@ -430,7 +430,10 @@ async def management_rate_limiter(auth = Depends(get_auth_user)):
         
         if len(MGMT_RATE_LIMIT_STORAGE[user_id]) >= MGMT_LIMIT_PER_MINUTE:
             logger.warning(f"Management rate limit exceeded for user: {user_id}")
-            raise HTTPException(status_code=429, detail="Too many dashboard requests. Please slow down.")
+            raise HTTPException(
+                status_code=429, 
+                detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many dashboard requests. Please slow down."}
+            )
             
         MGMT_RATE_LIMIT_STORAGE[user_id].append(now)
         
@@ -465,12 +468,12 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         requests_last_sec = [t for t in all_requests if now - t < 1.0]
         if len(requests_last_sec) >= sec_limit:
             logger.warning(f"Rate limit(second) exceeded for user: {user_id}")
-            raise HTTPException(status_code=429, detail="Rate limit(seconds) exceeded")
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Rate limit (seconds) exceeded."})
         
         # B. Dakikalık Kontrol (Son 60 saniye)
         if len(all_requests) >= minute_limit:
             logger.warning(f"Rate limit(minute) exceeded for user: {user_id}")
-            raise HTTPException(status_code=429, detail=f"Exceeded minute limit: ({minute_limit} req/min).")
+            raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": f"Exceeded minute limit: ({minute_limit} req/min)."})
             
         # İstek başarılı, zaman damgasını ekle
         RATE_LIMIT_STORAGE[user_id].append(now)
@@ -510,7 +513,7 @@ async def check_daily_limit(profile: dict):
         logger.warning(f"Daily limit exceeded for user: {user_id}")
         raise HTTPException(
             status_code=429, 
-            detail=f"Daily usage limit exceeded: max = {daily_limit}."
+            detail={"code": "DAILY_LIMIT_EXCEEDED", "message": f"Daily usage limit exceeded: max = {daily_limit}."}
         )
     
     return daily_usage
@@ -519,7 +522,7 @@ async def check_daily_limit(profile: dict):
 @app.post("/generate-api-key")
 async def generate_api_key(name: str = "Default Key", key_type: str = "live", current_user = Depends(rate_limiter)):
     if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     user_id = current_user["id"]
 
@@ -530,7 +533,7 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
             .eq("user_id", user_id).like("key_hint", "sk_test_%").execute()
         )
         if (test_res.count or 0) >= 1:
-            raise HTTPException(status_code=403, detail="Max allowed test key count = 1")
+            raise HTTPException(status_code=403, detail={"code": "MAX_TEST_KEYS_EXCEEDED", "message": "Max allowed test key count = 1"})
     
     # live key
     else:
@@ -548,7 +551,7 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
             .eq("user_id", user_id).like("key_hint", "sk_live_%").execute()
         )
         if (live_res.count or 0) >= max_live:
-            raise HTTPException(status_code=403, detail=f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed count: {max_live}.")
+            raise HTTPException(status_code=403, detail={"code": "MAX_LIVE_KEYS_EXCEEDED", "message": f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed count: {max_live}."})
 
     # create random key
     prefix = "sk_test_" if key_type == "test" else "sk_live_"
@@ -574,13 +577,13 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
         }
     except Exception as e:
         logger.error(f"Key generation error for user {current_user['id']}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Key generation error")
+        raise HTTPException(status_code=500, detail={"code": "KEY_GENERATION_ERROR", "message": f"Error occurred while generating API key for user {current_user['id']}."})
 
 # jwt
 @app.get("/api-keys")
 async def list_api_keys(current_user = Depends(management_rate_limiter)):
     if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     user_id = current_user["id"]
     
@@ -596,13 +599,13 @@ async def list_api_keys(current_user = Depends(management_rate_limiter)):
         return res.data
     except Exception as e:
         logger.error(f"Error fetching API keys for user {user_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not fetch API keys")
+        raise HTTPException(status_code=500, detail={"code": "API_KEY_FETCH_ERROR", "message": f"Could not fetch API keys for user {user_id}."})
 
 # jwt
 @app.delete("/api-keys/{key_id}")
 async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
     if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot be used for management endpoints. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     user_id = current_user["id"]
     
@@ -614,10 +617,11 @@ async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
             .eq("user_id", user_id)
             .execute()
         )
+        logger.info(f"API key {key_id} revoked by user {user_id}")
         return {"message": "API Key revoked successfully"}
     except Exception as e:
         logger.error(f"Error revoking API key {key_id} for user {user_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not revoke API key")
+        raise HTTPException(status_code=500, detail={"code": "API_KEY_REVOKE_ERROR", "message": f"Could not revoke API key {key_id} for user {user_id}."})
 
 # jwt + key
 @app.post("/v1/analyze")
@@ -633,24 +637,24 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
     if file_ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"unallowed file extension! Allowed extensions: {ALLOWED_EXTENSIONS}"
+            detail={"code": "INVALID_FILE_EXTENSION", "message": f"Allowed extensions: {ALLOWED_EXTENSIONS}"}
         )
     # mime type check
     if file.content_type not in ALLOWED_MIME_TYPES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="unallowed file mime type"
+            detail={"code": "INVALID_FILE_MIME_TYPE", "message": f"Allowed mime types: {ALLOWED_MIME_TYPES}"}
         )
     # file size check
     if file.size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"file is too big: max size is {MAX_FILE_SIZE / (1024*1024)}MB"
+            detail={"code": "FILE_TOO_LARGE", "message": f"file is too big: max size is {MAX_FILE_SIZE / (1024*1024)}MB"}
         )
     if file.size < MIN_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"file is too small: min size is {MIN_FILE_SIZE}KB"
+            detail={"code": "FILE_TOO_SMALL", "message": f"file is too small: min size is {MIN_FILE_SIZE}KB"}
         )
 
     if not is_test_mode:
@@ -658,7 +662,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         current_credits = profile_data.get("credits", 0)
         if current_credits <= 0:
             logger.warning(f"Insufficient credits for user: {active_client_id}")
-            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Not enough credits, please do payment")
+            raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail={"code": "INSUFFICIENT_CREDITS", "message": "Not enough credits, please do payment"})
         
         # check daily limit
         await check_daily_limit(profile_data)
@@ -672,7 +676,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             logger.error(f"Face detection error for request {request_id}", exc_info=True)
             raise HTTPException(
                 status_code=500, 
-                detail={"error": "Face detection service temporarily unavailable. No credits deducted."}
+                detail={"code": "FACE_DETECTION_ERROR", "message": "Face detection service temporarily unavailable. No credits deducted."}
             )
 
         # checkpoint 1: a human face check
@@ -745,8 +749,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         result = response.json()
 
         if result.get("status") != "success":
-            logger.error(f"Sightengine API error for request {request_id}: {result}")
-            raise HTTPException(status_code=400, detail={"request_id": request_id, "error": "Upstream API error"})
+            logger.error(f"Sightengine API error for request {request_id} - HTTP {response.status_code}: {result}")
+            raise HTTPException(status_code=400, detail={"code": "UPSTREAM_API_ERROR", "message": f"Upstream API error for request {request_id}."})
         provider_req_id = result.get("request", {}).get("id")
 
         genai_score = round(result.get("type", {}).get("ai_generated", 0) * 100, 2)
@@ -763,6 +767,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         openai_request_id = None
 
         if genai_score < 85.0 and deepfake_score < 80.0:
+            vlm_start = time.time()
             vlm_response = await call_vlm(content)
             semantic_anomaly_score = vlm_response["total_anomaly_score"]
             semantic_anomaly_reasons = vlm_response["anomaly_reasons"]
@@ -773,7 +778,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             vlm_completion_tokens = vlm_response.get("completion_tokens", 0)
             openai_request_id = vlm_response.get("openai_request_id")
 
-            logger.info(f"VLM Analysis completed for {request_id}. Score: {semantic_anomaly_score}")
+            logger.info(f"VLM Analysis completed for {request_id} in {time.time() - vlm_start:.2f}s. Score: {semantic_anomaly_score}")
         else:
             logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
 
@@ -827,13 +832,13 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 # clear
                 try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
                 except: pass
-                raise HTTPException(status_code=500, detail="Analysis could not be saved.")
+                raise HTTPException(status_code=500, detail={"code": "ANALYSIS_SAVE_ERROR", "message": f"Analysis could not be saved for request {request_id}."})
             history_id = db_insert_response.data[0]['id']
         except Exception as e:
             logger.error(f"Database technical exception for request {request_id}: {str(e)}")
             try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
             except: pass
-            raise HTTPException(status_code=500, detail="Database connection error.")
+            raise HTTPException(status_code=500, detail={"code": "DATABASE_CONNECTION_ERROR", "message": f"Database connection error for request {request_id}."})
 
         # --- BILLING LOGS (FİNANSAL TABLO EKLENTİSİ) ---
         try:
@@ -898,7 +903,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             )
             try: supabase.storage.from_("images").remove([file_path])
             except: pass
-            raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Kredi düşülmedi veya günlük sayaç artırılamadı, işlem iptal edildi."})
+            raise HTTPException(status_code=500, detail={"code": "BILLING_ERROR", "message": f"No credits used or daily count updated, process failed for request {request_id}."})
         
         logger.info(f"Analysis success - Request: {request_id}, User: {active_client_id}")
         return {
@@ -934,13 +939,13 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         raise
     except Exception as e:
         logger.error(f"Analysis general error for request {request_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"request_id": request_id, "error": "Internal server error."})
+        raise HTTPException(status_code=500, detail={"code": "INTERNAL_ERROR", "message": f"Internal server error for request {request_id}."})
 
 # jwt
 @app.get("/history")
 async def get_history(auth = Depends(management_rate_limiter)):
     if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
 
     active_client_id = auth["id"]
 
@@ -991,13 +996,13 @@ async def get_history(auth = Depends(management_rate_limiter)):
         return clean_history
     except Exception as e:
         logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=500, detail={"code": "INTERNAL_ERROR", "message": "Could not fetch history."})
 
 # jwt
 @app.delete("/history/{analysis_id}")
 async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_limiter)):
     if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot delete history. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     active_client_id = auth["id"]
     
@@ -1052,7 +1057,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
 @app.delete("/history/{analysis_id}/image")
 async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate_limiter)):
     if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     active_client_id = auth["id"]
     
@@ -1122,19 +1127,13 @@ def register(user: UserRegister):
         })
 
         if response.user is None:
-            raise HTTPException(
-                status_code=400,
-                detail="User could not be created"
-            )
+            raise HTTPException(status_code=400, detail={"code": "REGISTRATION_FAILED", "message": "User could not be created."})
 
         logger.info(f"Register success for user: {user.email}")
-        return {
-            "message": "user register success for " + user.email, 
-            "user": response.user
-        }
+        return {"message": "user register success for " + user.email, "user": response.user}
     except Exception as e:
         logger.error(f"Register error for {user.email}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"code": "REGISTRATION_ERROR", "message": "Internal server error during registration."})
     
 class UserLogin(BaseModel):
     email: EmailStr
@@ -1166,16 +1165,16 @@ def login(user: UserLogin):
         }
     except AuthApiError as e:
         logger.warning(f"Invalid login attempt for {user.email}")
-        raise HTTPException(status_code=401, detail=str(e.message))
+        raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "Invalid email or password."})
     except Exception as e:
         logger.error(f"Login error for {user.email}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail={"code": "LOGIN_ERROR", "message": "Internal server error."})
 
 # jwt
 @app.get("/me")
 async def get_me(auth = Depends(management_rate_limiter)):
     if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail="API keys cannot read history. Please use jwt access.")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     return auth.get("profile", {})
 
@@ -1320,4 +1319,4 @@ async def lemon_squeezy_webhook(request: Request):
     
     except Exception as e:
         logger.error("Webhook processing error", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail={"code": "WEBHOOK_ERROR", "message": "Internal server error processing webhook."})
