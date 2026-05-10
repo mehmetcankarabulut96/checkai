@@ -688,7 +688,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "error": {
                     "code": "FACE_NOT_DETECTED",
                     "message": "Analysis could not be started: No valid human face found in the image.",
-                    "recommendation": "Please upload a photo with a clear human face."
+                    "recommendation": "Please upload a clear photo of a single person. Group photos or distant shots may cause inaccurate results."
                 },
                 "meta": {
                     "credits_used": 0,
