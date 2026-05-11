@@ -675,10 +675,12 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
     start_time = time.time()
 
     # file extension check
+    file_name = file.filename or ""
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in ALLOWED_EXTENSIONS:
-        logger.warning(f"action=analysis_rejected | reason=invalid_file_extension | extension={file_ext} | user_id={active_client_id}")
-        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "INVALID_FILE_EXTENSION", f"Extension not allowed: {file_ext}")
+        display_ext = file_ext if file_ext else "No extension"
+        logger.warning(f"action=analysis_rejected | reason=invalid_file_extension | extension={display_ext} | user_id={active_client_id}")
+        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "INVALID_FILE_EXTENSION", f"Extension not allowed: {display_ext}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_FILE_EXTENSION", "message": f"Allowed extensions: {ALLOWED_EXTENSIONS}"}
