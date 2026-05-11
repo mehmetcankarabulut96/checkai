@@ -1160,38 +1160,12 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
     except Exception as e:
         logger.error(f"action=image_delete_failed | analysis_id={analysis_id} | user_id={active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred during deletion.")
-
-class UserRegister(BaseModel):
-    email: EmailStr
-    password: str
-
-# will deprecated soon
-@app.post("/register", dependencies=[Depends(auth_rate_limiter)])
-def register(user: UserRegister):
-    try:
-        # Supabase auth modülü parolayı kendisi şifreler
-        response = supabase.auth.sign_up({
-            "email": user.email,
-            "password": user.password
-        })
-
-        if response.user is None:
-            logger.warning(f"action=register_rejected | reason=creation_failed | email={user.email}")
-            raise HTTPException(status_code=400, detail={"code": "REGISTRATION_FAILED", "message": "User could not be created."})
-
-        logger.info(f"action=register_success | user_id={response.user.id} | email={user.email}")
-        return {"message": "user register success for " + user.email, "user": response.user}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"action=register_failed | email={user.email}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"code": "REGISTRATION_ERROR", "message": "Internal server error during registration."})
     
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-# will deprecated soon
+# should be used only development for api testing, not for production
 @app.post("/login", dependencies=[Depends(auth_rate_limiter)])
 def login(user: UserLogin):
     try:
