@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64, logging, sys
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -166,11 +166,17 @@ app = FastAPI(title="checkai b2b api", version="1.0.0")
 load_dotenv()
 
 # logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
+
+# console logger for development and debugging
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.addHandler(console_handler)
+logger.info("action=logger_init | status=render_logs_ready")
 
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -209,10 +215,26 @@ try:
         min_detection_confidence=0.5
     )
     face_detector = vision.FaceDetector.create_from_options(options)
-    logger.info("MediaPipe Face Detector loaded successfully.")
+    logger.info("action=model_load | model=mediapipe_face_detector | status=success")
 except Exception as e:
-    logger.critical(f"FATAL: MediaPipe model could not be loaded: {e}")
+    logger.critical(f"action=model_load | model=mediapipe_face_detector | status=failure | error={str(e)}", exc_info=True)
     raise RuntimeError(f"Model load failure: {e}")
+
+async def log_failed_request_to_db(user_id: str, request_id: str, endpoint: str, error_code: str, message: str):
+    """Kullanıcının iş akışını bozan mantıksal hataları (Business Logic) DB'ye kaydeder."""
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("failed_requests_log").insert({
+                "user_id": user_id,
+                "request_id": request_id,
+                "endpoint": endpoint,
+                "error_code": error_code,
+                "message": message
+            }).execute()
+        )
+    except Exception as e:
+        # Loglama işleminin kendisi hata verirse sistemi çökertmez, sadece CloudWatch'a yazar.
+        logger.error(f"action=db_log_failed | request_id={request_id} | error={str(e)}")
 
 async def call_vlm(image_content: bytes) -> dict:
     """
@@ -263,7 +285,7 @@ async def call_vlm(image_content: bytes) -> dict:
         sub_details = json.loads(raw_json)
         
     except Exception as e:
-        logger.error(f"VLM API Call failed: {str(e)}")
+        logger.error("action=vlm_api_failed", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
@@ -304,6 +326,7 @@ async def has_human_face(image_bytes: bytes) -> bool:
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
+            logger.warning("action=image_decode_failed | reason=cv2_imdecode_returned_none")
             return False
             
         # MediaPipe RGB formatı bekler
@@ -324,7 +347,7 @@ async def has_human_face(image_bytes: bytes) -> bool:
         return False
         
     except Exception as e:
-        logger.error("Face detection engine failed", exc_info=True)
+        logger.error("action=face_detection_engine_failed", exc_info=True)
         raise RuntimeError("Face detection engine failed") from e
 
 async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -344,9 +367,9 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         if result.data:
             user_id = result.data[0]["user_id"]
             auth_info = {"id": user_id, "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
-            logger.info(f"api-key accepted. key-hash: {hashed_key}")
+            logger.info(f"action=auth_success | auth_type=api_key | key_hash={hashed_key} | user_id={user_id}")
         else:
-            logger.warning(f"Invalid or inactive API key attempt. key-hash: {hashed_key}")
+            logger.warning(f"action=auth_failed | reason=invalid_api_key | key_hash={hashed_key}")
             raise HTTPException(status_code=401, detail={"code": "INVALID_API_KEY", "message": "Invalid or inactive API key."})
     # JWT
     elif credentials:
@@ -356,9 +379,9 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             )
             user_id = user_response.user.id
             auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt"}
-            logger.info(f"jwt accepted: user: {user_id}")
+            logger.info(f"action=auth_success | auth_type=jwt | user_id={user_id}")
         except Exception as e:
-            logger.warning(f"Invalid JWT attempt: {str(e)}")
+            logger.warning(f"action=auth_failed | reason=invalid_jwt | error={str(e)}")
             raise HTTPException(status_code=401, detail={"code": "INVALID_JWT", "message": "Invalid or expired token."})
     
     if user_id:
@@ -375,7 +398,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         profile = getattr(profile_res, "data", None)
 
         if not profile:
-            logger.error(f"Data Integrity Error: Authenticated user {user_id} has no profile entry!")
+            logger.error(f"action=auth_failed | reason=profile_missing | user_id={user_id}")
             raise HTTPException(
                 status_code=404, 
                 detail={"code": "PROFILE_NOT_FOUND", "message": "User profile not found."}
@@ -383,7 +406,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         
         # waitlist check
         if not profile.get("is_allowed", False):
-            logger.warning(f"Waitlist access denied: User {user_id} is waiting for approval.")
+            logger.warning(f"action=auth_rejected | reason=waitlist | user_id={user_id}")
             raise HTTPException(
                 status_code=403, 
                 detail={"code": "WAITLIST_REQUIRED", "message": "You do not have access permissions yet."}
@@ -393,7 +416,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
         return auth_info
 
     # unauthorized
-    logger.warning("Unauthorized API access attempt.")
+    logger.warning("action=auth_rejected | reason=unauthorized_request")
     raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "Unauthorized request."})
 
 # register ve login endpointleri için limiter
@@ -408,7 +431,7 @@ async def auth_rate_limiter(request: Request):
         AUTH_RATE_LIMIT_STORAGE[ip] = [t for t in AUTH_RATE_LIMIT_STORAGE[ip] if now - t < 60.0]
         
         if len(AUTH_RATE_LIMIT_STORAGE[ip]) >= AUTH_LIMIT_PER_MINUTE:
-            logger.warning(f"IP based rate limit exceeded for: {ip}")
+            logger.warning(f"action=rate_limit_exceeded | type=auth_ip | ip={ip}")
             raise HTTPException(
                 status_code=429, 
                 detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many attempts. Please try again in a minute."}
@@ -429,7 +452,7 @@ async def management_rate_limiter(auth = Depends(get_auth_user)):
         MGMT_RATE_LIMIT_STORAGE[user_id] = [t for t in MGMT_RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
         
         if len(MGMT_RATE_LIMIT_STORAGE[user_id]) >= MGMT_LIMIT_PER_MINUTE:
-            logger.warning(f"Management rate limit exceeded for user: {user_id}")
+            logger.warning(f"action=rate_limit_exceeded | type=management | user_id={user_id}")
             raise HTTPException(
                 status_code=429, 
                 detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many dashboard requests. Please slow down."}
@@ -467,12 +490,12 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         # A. Saniyelik Kontrol (Son 1 saniye)
         requests_last_sec = [t for t in all_requests if now - t < 1.0]
         if len(requests_last_sec) >= sec_limit:
-            logger.warning(f"Rate limit(second) exceeded for user: {user_id}")
+            logger.warning(f"action=rate_limit_exceeded | type=api_second | limit={sec_limit} | user_id={user_id}")
             raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Rate limit (seconds) exceeded."})
         
         # B. Dakikalık Kontrol (Son 60 saniye)
         if len(all_requests) >= minute_limit:
-            logger.warning(f"Rate limit(minute) exceeded for user: {user_id}")
+            logger.warning(f"action=rate_limit_exceeded | type=api_minute | limit={minute_limit} | user_id={user_id}")
             raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": f"Exceeded minute limit: ({minute_limit} req/min)."})
             
         # İstek başarılı, zaman damgasını ekle
@@ -481,7 +504,7 @@ async def rate_limiter(auth = Depends(get_auth_user)):
     # Endpoint'in kullanması için auth datayı geri dön
     return auth
 
-async def check_daily_limit(profile: dict):
+async def check_daily_limit(profile: dict, request_id: str = "N/A", endpoint: str = "N/A"):
     user_id = profile.get("id")
     daily_usage = profile.get("daily_usage", 0)
     last_reset_str = profile.get("last_daily_usage_reset")
@@ -501,16 +524,29 @@ async def check_daily_limit(profile: dict):
     last_reset = datetime.fromisoformat(last_reset_str.replace('Z', '+00:00'))
     
     if (now - last_reset).total_seconds() >= 86400:
-        daily_usage = 0
-        await asyncio.to_thread(
-            lambda: supabase.table("profiles")
-            .update({"daily_usage": 0, "last_daily_usage_reset": now.isoformat()})
-            .eq("id", user_id).execute()
-        )
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("profiles")
+                .update({"daily_usage": 0, "last_daily_usage_reset": now.isoformat()})
+                .eq("id", user_id).execute()
+            )
+            logger.info(f"action=daily_usage_reset_success | user_id={user_id} | previous_usage={daily_usage}")
+            daily_usage = 0
+        except Exception as e:
+            logger.error(f"action=daily_usage_reset_failed | user_id={user_id}", exc_info=True)
 
     # Limit Aşım Kontrolü
     if daily_usage >= daily_limit:
-        logger.warning(f"Daily limit exceeded for user: {user_id}")
+        logger.warning(f"action=daily_limit_exceeded | limit={daily_limit} | user_id={user_id}")
+
+        await log_failed_request_to_db(
+            user_id=user_id, 
+            request_id=request_id, 
+            endpoint=endpoint, 
+            error_code="DAILY_LIMIT_EXCEEDED", 
+            message=f"Daily usage limit exceeded: max = {daily_limit}."
+        )
+
         raise HTTPException(
             status_code=429, 
             detail={"code": "DAILY_LIMIT_EXCEEDED", "message": f"Daily usage limit exceeded: max = {daily_limit}."}
@@ -521,10 +557,11 @@ async def check_daily_limit(profile: dict):
 # jwt
 @app.post("/generate-api-key")
 async def generate_api_key(name: str = "Default Key", key_type: str = "live", current_user = Depends(rate_limiter)):
-    if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-    
     user_id = current_user["id"]
+
+    if current_user.get("auth_type") == "api_key":
+        logger.warning(f"action=api_key_generation_rejected | reason=invalid_auth_method | user_id={user_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
 
     # test key: max 1 for every user
     if key_type == "test":
@@ -533,6 +570,7 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
             .eq("user_id", user_id).like("key_hint", "sk_test_%").execute()
         )
         if (test_res.count or 0) >= 1:
+            logger.warning(f"action=api_key_generation_rejected | reason=max_test_keys_exceeded | user_id={user_id}")
             raise HTTPException(status_code=403, detail={"code": "MAX_TEST_KEYS_EXCEEDED", "message": "Max allowed test key count = 1"})
     
     # live key
@@ -551,6 +589,7 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
             .eq("user_id", user_id).like("key_hint", "sk_live_%").execute()
         )
         if (live_res.count or 0) >= max_live:
+            logger.warning(f"action=api_key_generation_rejected | reason=max_live_keys_exceeded | plan={plan_type} | user_id={user_id}")
             raise HTTPException(status_code=403, detail={"code": "MAX_LIVE_KEYS_EXCEEDED", "message": f"API Key limit reached for {plan_type.upper()} plan. Maximum allowed count: {max_live}."})
 
     # create random key
@@ -569,23 +608,24 @@ async def generate_api_key(name: str = "Default Key", key_type: str = "live", cu
         await asyncio.to_thread(
             lambda: supabase.table("api_keys").insert(db_data).execute()
         )
-        logger.info(f"New API key generated for user: {current_user['id']}")
+        logger.info(f"action=api_key_created | type={key_type} | user_id={user_id}")
         return {
             "api_key": raw_key,
             "type": key_type,
             "message": "Save these keys safely. They cannot be read again."
         }
     except Exception as e:
-        logger.error(f"Key generation error for user {current_user['id']}", exc_info=True)
+        logger.error(f"action=api_key_creation_failed | user_id={user_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "KEY_GENERATION_ERROR", "message": f"Error occurred while generating API key for user {current_user['id']}."})
 
 # jwt
 @app.get("/api-keys")
 async def list_api_keys(current_user = Depends(management_rate_limiter)):
-    if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-    
     user_id = current_user["id"]
+    
+    if current_user.get("auth_type") == "api_key":
+        logger.warning(f"action=api_key_fetch_rejected | reason=invalid_auth_method | user_id={user_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     try:
         res = await asyncio.to_thread(
@@ -596,18 +636,20 @@ async def list_api_keys(current_user = Depends(management_rate_limiter)):
             .order("created_at", desc=True)
             .execute()
         )
+        logger.info(f"action=api_keys_fetched | count={len(res.data)} | user_id={user_id}")
         return res.data
     except Exception as e:
-        logger.error(f"Error fetching API keys for user {user_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"code": "API_KEY_FETCH_ERROR", "message": f"Could not fetch API keys for user {user_id}."})
+        logger.error(f"action=api_key_fetch_failed | user_id={user_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"code": "API_KEY_FETCH_ERROR", "message": f"Could not fetch API keys."})
 
 # jwt
 @app.delete("/api-keys/{key_id}")
 async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
-    if current_user.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-    
     user_id = current_user["id"]
+    
+    if current_user.get("auth_type") == "api_key":
+        logger.warning(f"action=api_key_revoke_rejected | reason=invalid_auth_method | user_id={user_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     try:
         await asyncio.to_thread(
@@ -617,11 +659,11 @@ async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
             .eq("user_id", user_id)
             .execute()
         )
-        logger.info(f"API key {key_id} revoked by user {user_id}")
+        logger.info(f"action=api_key_revoked | key_id={key_id} | user_id={user_id}")
         return {"message": "API Key revoked successfully"}
     except Exception as e:
-        logger.error(f"Error revoking API key {key_id} for user {user_id}", exc_info=True)
-        raise HTTPException(status_code=500, detail={"code": "API_KEY_REVOKE_ERROR", "message": f"Could not revoke API key {key_id} for user {user_id}."})
+        logger.error(f"action=api_key_revoke_failed | key_id={key_id} | user_id={user_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"code": "API_KEY_REVOKE_ERROR", "message": f"Could not revoke API key {key_id}."})
 
 # jwt + key
 @app.post("/v1/analyze")
@@ -635,23 +677,31 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
     # file extension check
     file_ext = os.path.splitext(file.filename)[1].lower()
     if file_ext not in ALLOWED_EXTENSIONS:
+        logger.warning(f"action=analysis_rejected | reason=invalid_file_extension | extension={file_ext} | user_id={active_client_id}")
+        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "INVALID_FILE_EXTENSION", f"Extension not allowed: {file_ext}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_FILE_EXTENSION", "message": f"Allowed extensions: {ALLOWED_EXTENSIONS}"}
         )
     # mime type check
     if file.content_type not in ALLOWED_MIME_TYPES:
+        logger.warning(f"action=analysis_rejected | reason=invalid_file_mime_type | mime={file.content_type} | user_id={active_client_id}")
+        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "INVALID_FILE_MIME_TYPE", f"Mime type not allowed: {file.content_type}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_FILE_MIME_TYPE", "message": f"Allowed mime types: {ALLOWED_MIME_TYPES}"}
         )
     # file size check
     if file.size > MAX_FILE_SIZE:
+        logger.warning(f"action=analysis_rejected | reason=file_too_large | size_bytes={file.size} | user_id={active_client_id}")
+        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "FILE_TOO_LARGE", "File size exceeds maximum limit.")
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail={"code": "FILE_TOO_LARGE", "message": f"file is too big: max size is {MAX_FILE_SIZE / (1024*1024)}MB"}
         )
     if file.size < MIN_FILE_SIZE:
+        logger.warning(f"action=analysis_rejected | reason=file_too_small | size_bytes={file.size} | user_id={active_client_id}")
+        await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "FILE_TOO_SMALL", "File size is below minimum limit.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "FILE_TOO_SMALL", "message": f"file is too small: min size is {MIN_FILE_SIZE}KB"}
@@ -661,11 +711,12 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         # check credits
         current_credits = profile_data.get("credits", 0)
         if current_credits <= 0:
-            logger.warning(f"Insufficient credits for user: {active_client_id}")
+            logger.warning(f"action=analysis_rejected | reason=insufficient_credits | user_id={active_client_id}")
+            await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "INSUFFICIENT_CREDITS", "Not enough credits.")
             raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail={"code": "INSUFFICIENT_CREDITS", "message": "Not enough credits, please do payment"})
         
         # check daily limit
-        await check_daily_limit(profile_data)
+        await check_daily_limit(profile=profile_data, request_id=request_id, endpoint="/v1/analyze")
 
     try:
         content = await file.read()
@@ -673,7 +724,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         try:
             is_human = await has_human_face(content)
         except Exception as face_err:
-            logger.error(f"Face detection error for request {request_id}", exc_info=True)
+            logger.error(f"action=face_detection_failed | request_id={request_id}", exc_info=True)
             raise HTTPException(
                 status_code=500, 
                 detail={"code": "FACE_DETECTION_ERROR", "message": "Face detection service temporarily unavailable. No credits deducted."}
@@ -681,7 +732,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
 
         # checkpoint 1: a human face check
         if not is_human:
-            logger.info(f"Pre-check failed: No human face - Request: {request_id}, User: {active_client_id}.")
+            logger.warning(f"action=analysis_rejected | reason=face_not_detected | request_id={request_id} | user_id={active_client_id}")
+            await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "FACE_NOT_DETECTED", "No valid human face found in the image.")
             return {
                 "request_id": request_id,
                 "status": "failed",
@@ -705,7 +757,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             await asyncio.sleep(1.2)
             test_decision = ANALYSIS_MAP["AUTHENTIC"]
 
-            logger.info(f"Test analysis successful - Request: {request_id}, User: {active_client_id}")
+            logger.info(f"action=analysis_success | mode=test | request_id={request_id} | user_id={active_client_id}")
             return {
                 "request_id": request_id,
                 "status": "success",
@@ -749,7 +801,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         result = response.json()
 
         if result.get("status") != "success":
-            logger.error(f"Sightengine API error for request {request_id} - HTTP {response.status_code}: {result}")
+            logger.error(f"action=sightengine_api_failed | request_id={request_id} | http_status={response.status_code}")
             raise HTTPException(status_code=400, detail={"code": "UPSTREAM_API_ERROR", "message": f"Upstream API error for request {request_id}."})
         provider_req_id = result.get("request", {}).get("id")
 
@@ -761,7 +813,6 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         semantic_anomaly_reasons = None
         semantic_anomaly_explanation = None
         semantic_anomaly_details = None
-
         vlm_prompt_tokens = 0
         vlm_completion_tokens = 0
         openai_request_id = None
@@ -773,14 +824,14 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             semantic_anomaly_reasons = vlm_response["anomaly_reasons"]
             semantic_anomaly_explanation = vlm_response["anomaly_explanation"]
             semantic_anomaly_details = vlm_response["details"]
-            
+        
             vlm_prompt_tokens = vlm_response.get("prompt_tokens", 0)
             vlm_completion_tokens = vlm_response.get("completion_tokens", 0)
             openai_request_id = vlm_response.get("openai_request_id")
 
-            logger.info(f"VLM Analysis completed for {request_id} in {time.time() - vlm_start:.2f}s. Score: {semantic_anomaly_score}")
+            logger.info(f"action=vlm_analysis_completed | request_id={request_id} | duration_sec={time.time() - vlm_start:.2f} | score={semantic_anomaly_score}")
         else:
-            logger.info(f"VLM skipped: Technical confidence high for request {request_id}")
+            logger.info(f"action=vlm_skipped | reason=high_technical_confidence | request_id={request_id}")
 
         # calculate authenticity score
         safe_semantic_score = semantic_anomaly_score if semantic_anomaly_score is not None else 0.0
@@ -794,7 +845,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         elif safe_semantic_score >= 40.0 or deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
-        # Resmi Storage'a yükle ve URL al, dosya isimlerini unique yap
+        # storage
         unique_filename = f"{uuid.uuid4()}{file_ext}"
         file_path = f"{active_client_id}/{unique_filename}"
         await asyncio.to_thread(
@@ -811,7 +862,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             if not image_url:
                 raise Exception("Signed URL generation returned empty.")
         except Exception as url_err:
-            logger.error(f"Unexpected error occurred while generating signed URL for {request_id}: {str(url_err)}")
+            logger.error(f"action=signed_url_generation_failed | request_id={request_id}", exc_info=True)
             raise HTTPException(status_code=500, detail={"code": "URL_GENERATION_ERROR", "message": "Secure image access could not be generated."})
 
         # db insert
@@ -835,23 +886,20 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             db_insert_response = await asyncio.to_thread(
                 lambda: supabase.table("analysis_history").insert(db_data).execute()
             )
-            # empty result
             if not db_insert_response.data:
-                logger.error(f"Database insertion failed (Empty Data) for request {request_id}")
-                # clear
+                logger.error(f"action=db_insert_failed | reason=empty_data | request_id={request_id}")
                 try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
                 except: pass
                 raise HTTPException(status_code=500, detail={"code": "ANALYSIS_SAVE_ERROR", "message": f"Analysis could not be saved for request {request_id}."})
             history_id = db_insert_response.data[0]['id']
         except Exception as e:
-            logger.error(f"Database technical exception for request {request_id}: {str(e)}")
+            logger.error(f"action=db_insert_failed | reason=exception | request_id={request_id}", exc_info=True)
             try: await asyncio.to_thread(lambda: supabase.storage.from_("images").remove([file_path]))
             except: pass
             raise HTTPException(status_code=500, detail={"code": "DATABASE_CONNECTION_ERROR", "message": f"Database connection error for request {request_id}."})
 
-        # --- BILLING LOGS (FİNANSAL TABLO EKLENTİSİ) ---
+        # billing logs
         try:
-            # 1. Config'den Fiyatları Çek
             pricing_res = await asyncio.to_thread(
                 lambda: supabase.table("pricing_config").select("*").execute()
             )
@@ -859,22 +907,14 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             gpt = pricing_data.get("gpt-4o-mini", {"input_unit_price": -1, "output_unit_price": -1, "unit_size": 1000000, "unit_type": "token"})
             se = pricing_data.get("sightengine_check_v1", {"input_unit_price": -1, "output_unit_price": -1, "unit_size": 1, "unit_type": "operation"})
 
-            # 2. VLM Maliyet Hesaplama
             vlm_in_cost = (vlm_prompt_tokens / float(gpt["unit_size"])) * float(gpt["input_unit_price"])
             vlm_out_cost = (vlm_completion_tokens / float(gpt["unit_size"])) * float(gpt["output_unit_price"])
-
-            # 3. Sightengine Maliyet Hesaplama
             se_ops = 10 # genai(5) + deepfake(5)
             se_cost = (se_ops / float(se["unit_size"])) * float(se["input_unit_price"])
-
-            # 4. Toplam Maliyet
             total_analysis_cost = vlm_in_cost + vlm_out_cost + se_cost
 
-            # 5. insert billing log
             billing_data = {
                 "analysis_id": history_id,
-                
-                # VLM Detayları
                 "vlm_input_amount_consumed": vlm_prompt_tokens,
                 "vlm_output_amount_consumed": vlm_completion_tokens,
                 "vlm_input_unit_price": float(gpt["input_unit_price"]),
@@ -883,30 +923,25 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "vlm_unit_type": gpt["unit_type"],
                 "vlm_input_cost": round(vlm_in_cost, 6),
                 "vlm_output_cost": round(vlm_out_cost, 6),
-                
-                # Sightengine Detayları
                 "se_amount_consumed": se_ops,
                 "se_unit_price": float(se["input_unit_price"]),
                 "se_unit_size": int(se["unit_size"]),
                 "se_unit_type": se["unit_type"],
                 "se_total_cost": round(se_cost, 6),
-                
                 "analysis_total_cost": round(total_analysis_cost, 6)
             }
-            
             await asyncio.to_thread(lambda: supabase.table("billing_logs").insert(billing_data).execute())
         except Exception as b_err:
-            logger.error(f"CRITICAL: Billing logging failed for analysis {history_id}: {str(b_err)}")
+            logger.critical(f"action=billing_log_failed | analysis_id={history_id}", exc_info=True)
 
-        # güvenli kredi düşme ve günlük sayaç artırma
+        # credits update via rpc
         try:
             rpc_response = await asyncio.to_thread(
                 lambda: supabase.rpc("process_analysis_billing", {"user_id": active_client_id}).execute()
             )
             new_credits = rpc_response.data
         except Exception as db_err:
-            logger.error(f"Billing/DB transaction failed for request {request_id}", exc_info=True)
-            # İşlem DB seviyesinde reddedildi, eklenen çöp verileri temizle
+            logger.error(f"action=billing_rpc_failed | request_id={request_id}", exc_info=True)
             await asyncio.to_thread(
                 lambda: supabase.table("analysis_history").delete().eq("id", history_id).execute()
             )
@@ -914,7 +949,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             except: pass
             raise HTTPException(status_code=500, detail={"code": "BILLING_ERROR", "message": f"No credits used or daily count updated, process failed for request {request_id}."})
         
-        logger.info(f"Analysis success - Request: {request_id}, User: {active_client_id}")
+        logger.info(f"action=analysis_success | mode=live | request_id={request_id} | user_id={active_client_id} | score={authenticity_score}")
         return {
             "request_id": request_id,
             "status": "success",
@@ -947,16 +982,17 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Analysis general error for request {request_id}", exc_info=True)
+        logger.error(f"action=analysis_general_error | request_id={request_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "INTERNAL_ERROR", "message": f"Internal server error for request {request_id}."})
 
 # jwt
 @app.get("/history")
 async def get_history(auth = Depends(management_rate_limiter)):
-    if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-
     active_client_id = auth["id"]
+    
+    if auth.get("auth_type") == "api_key":
+        logger.warning(f"action=history_fetch_rejected | reason=invalid_auth_method | user_id={active_client_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
 
     try:
         # Sadece giriş yapan kullanıcıya ait verileri çek
@@ -1004,16 +1040,17 @@ async def get_history(auth = Depends(management_rate_limiter)):
 
         return clean_history
     except Exception as e:
-        logger.error(f"History fetch error for user {active_client_id}", exc_info=True)
+        logger.error(f"action=history_fetch_failed | user_id={active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "INTERNAL_ERROR", "message": "Could not fetch history."})
 
 # jwt
 @app.delete("/history/{analysis_id}")
 async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_limiter)):
-    if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-    
     active_client_id = auth["id"]
+    
+    if auth.get("auth_type") == "api_key":
+        logger.warning(f"action=analysis_delete_rejected | reason=invalid_auth_method | user_id={active_client_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     try:
         res = await asyncio.to_thread(
@@ -1037,7 +1074,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
                     lambda: supabase.storage.from_("images").remove([file_path])
                 )
             except Exception as e:
-                logger.error(f"Physical image deletion failed for {analysis_id}: {str(e)}")
+                logger.error(f"action=physical_image_delete_failed | analysis_id={analysis_id} | error={str(e)}")
 
         now_iso = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(
@@ -1050,7 +1087,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
             .execute()
         )
 
-        logger.info(f"Full analysis soft-deleted: {analysis_id} by user {active_client_id}")
+        logger.info(f"action=analysis_soft_deleted | analysis_id={analysis_id} | user_id={active_client_id}")
         return {
             "status": "success", 
             "message": "Analysis record and associated image have been removed."
@@ -1059,16 +1096,17 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error during full analysis deletion: {analysis_id}", exc_info=True)
+        logger.error(f"action=analysis_delete_failed | analysis_id={analysis_id} | user_id={active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error during deletion.")
 
 # jwt
 @app.delete("/history/{analysis_id}/image")
 async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate_limiter)):
-    if auth.get("auth_type") == "api_key":
-        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
-    
     active_client_id = auth["id"]
+    
+    if auth.get("auth_type") == "api_key":
+        logger.warning(f"action=image_delete_rejected | reason=invalid_auth_method | user_id={active_client_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     try:
         # Kaydı bul ve sahipliği kontrol et
@@ -1093,7 +1131,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
             image_url = log["image_url"]
             file_path = image_url.split("/images/")[1]
         except Exception:
-            logger.error(f"Malformed image URL for analysis {analysis_id}: {image_url}")
+            logger.error(f"action=image_url_parse_failed | analysis_id={analysis_id} | url={image_url}")
             raise HTTPException(status_code=500, detail="Could not parse image path.")
 
         # Storage'dan dosyayı fiziksel olarak sil
@@ -1109,7 +1147,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
             .execute()
         )
 
-        logger.info(f"Image manually deleted from storage for analysis {analysis_id} by user {active_client_id}")
+        logger.info(f"action=image_manually_deleted | analysis_id={analysis_id} | user_id={active_client_id}")
         return {
             "status": "success", 
             "message": "Image permanently deleted from storage."
@@ -1118,7 +1156,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error during manual image deletion for analysis {analysis_id}", exc_info=True)
+        logger.error(f"action=image_delete_failed | analysis_id={analysis_id} | user_id={active_client_id}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred during deletion.")
 
 class UserRegister(BaseModel):
@@ -1136,12 +1174,15 @@ def register(user: UserRegister):
         })
 
         if response.user is None:
+            logger.warning(f"action=register_rejected | reason=creation_failed | email={user.email}")
             raise HTTPException(status_code=400, detail={"code": "REGISTRATION_FAILED", "message": "User could not be created."})
 
-        logger.info(f"Register success for user: {user.email}")
+        logger.info(f"action=register_success | user_id={response.user.id} | email={user.email}")
         return {"message": "user register success for " + user.email, "user": response.user}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Register error for {user.email}", exc_info=True)
+        logger.error(f"action=register_failed | email={user.email}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "REGISTRATION_ERROR", "message": "Internal server error during registration."})
     
 class UserLogin(BaseModel):
@@ -1163,7 +1204,7 @@ def login(user: UserLogin):
         profile_res = supabase.table("profiles").select("is_allowed").eq("id", user_id).maybe_single().execute()
         is_allowed = profile_res.data.get("is_allowed", False) if profile_res.data else False
 
-        logger.info(f"Login success for user: {user.email} - Allowed: {is_allowed}")
+        logger.info(f"action=login_success | user_id={user_id} | email={user.email} | is_allowed={is_allowed}")
 
         return {
             "message": "login success",
@@ -1172,17 +1213,20 @@ def login(user: UserLogin):
             "token_type": "bearer",
             "is_allowed": is_allowed
         }
-    except AuthApiError as e:
-        logger.warning(f"Invalid login attempt for {user.email}")
+    except AuthApiError:
+        logger.warning(f"action=login_failed | reason=invalid_credentials | email={user.email}")
         raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "Invalid email or password."})
     except Exception as e:
-        logger.error(f"Login error for {user.email}", exc_info=True)
+        logger.error(f"action=login_error | email={user.email}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "LOGIN_ERROR", "message": "Internal server error."})
 
 # jwt
 @app.get("/me")
 async def get_me(auth = Depends(management_rate_limiter)):
+    user_id = auth.get("id")
+
     if auth.get("auth_type") == "api_key":
+        logger.warning(f"action=profile_fetch_rejected | reason=invalid_auth_method | user_id={user_id}")
         raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
     return auth.get("profile", {})
@@ -1194,7 +1238,7 @@ async def lemon_squeezy_webhook(request: Request):
     signature = request.headers.get("X-Signature")
     
     if not signature:
-        logger.warning("Webhook signature verification failed.")
+        logger.warning("action=webhook_rejected | reason=missing_signature")
         raise HTTPException(status_code=400, detail="Missing signature")
 
     body = await request.body()
@@ -1202,7 +1246,7 @@ async def lemon_squeezy_webhook(request: Request):
     # Güvenlik Doğrulaması
     hash_obj = hmac.new(secret, body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(hash_obj, signature):
-        logger.warning("Webhook signature verification failed.")
+        logger.warning("action=webhook_rejected | reason=invalid_signature")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     payload = json.loads(body)
@@ -1211,7 +1255,7 @@ async def lemon_squeezy_webhook(request: Request):
     user_id = custom_data.get("user_id")
 
     if not user_id:
-        logger.info(f"Webhook received but user_id missing. Payload: {payload}")
+        logger.warning(f"action=webhook_ignored | reason=missing_user_id | event={event_name}")
         return {"status": "ignored", "reason": "user_id not found"}
     
     attributes = payload.get("data", {}).get("attributes", {})
@@ -1219,7 +1263,7 @@ async def lemon_squeezy_webhook(request: Request):
     billing_reason = attributes.get("billing_reason")
 
     # BÖCEK AVI
-    logger.info(f"Webhook received - Event: {event_name}, Variant: {variant_id}, User: {user_id}")
+    logger.info(f"action=webhook_received | event={event_name} | variant={variant_id} | user_id={user_id}")
 
     # lemon squeezy variants
     LITE_VARIANT_ID = "1490345"
@@ -1228,8 +1272,6 @@ async def lemon_squeezy_webhook(request: Request):
 
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
-
-        # Veritabanına gönderilecek ana paket
         update_data = {}
 
         # 1. Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
@@ -1257,6 +1299,7 @@ async def lemon_squeezy_webhook(request: Request):
             elif event_name == 'subscription_payment_success':
                 # İlk satın alma işleminde krediler subscription_created ile verildiği için bunu yoksay
                 if billing_reason == 'initial':
+                    logger.info(f"action=webhook_ignored | reason=initial_payment_handled | user_id={user_id}")
                     return {"status": "ignored", "reason": "Initial payment handled by subscription_created"}
                 
                 db_profile = await asyncio.to_thread(
@@ -1266,6 +1309,7 @@ async def lemon_squeezy_webhook(request: Request):
                 plan_type = profile_data.get("plan_type", "free")
                 
                 if plan_type == "free":
+                    logger.info(f"action=webhook_ignored | reason=free_plan_payment | user_id={user_id}")
                     return {"status": "ignored", "reason": "Free plan payment success ignored"}
         
                 if plan_type == "business":
@@ -1275,7 +1319,7 @@ async def lemon_squeezy_webhook(request: Request):
 
             # Durum C: Variant ID yok ve ödeme başarılı eventi değilse
             else:
-                logger.warning(f"Webhook skipped - Event: {event_name}, Variant: {variant_id}")
+                logger.warning(f"action=webhook_skipped | reason=unknown_variant | event={event_name} | variant={variant_id} | user_id={user_id}")
                 return {"status": "ignored", "reason": "Missing or unknown variant_id"}
             
             # Ortak güncellenecek alanları update_data'ya ekle
@@ -1317,15 +1361,16 @@ async def lemon_squeezy_webhook(request: Request):
                     .eq("id", user_id)
                     .execute()
             )
-            logger.info(f"Successfully updated profile for user {user_id}")
+            logger.info(f"action=webhook_processed_successfully | event={event_name} | updated_plan={update_data.get('plan_type')} | user_id={user_id}")
         else:
             # Bilinen bir event geldi ama hiçbir mantığa girmediyse BURASI KRİTİK
             if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
-                logger.error(f"CRITICAL: Payment event received but update_data is empty! Payload: {payload}")
+                logger.error(f"action=webhook_critical_error | reason=empty_update_data | event={event_name} | user_id={user_id}")
                 raise HTTPException(status_code=422, detail="Update data could not be constructed")
             
         return {"status": "success"}
-    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Webhook processing error", exc_info=True)
+        logger.error(f"action=webhook_processing_failed | event={event_name} | user_id={user_id}", exc_info=True)
         raise HTTPException(status_code=500, detail={"code": "WEBHOOK_ERROR", "message": "Internal server error processing webhook."})
