@@ -923,23 +923,10 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             lambda: supabase.storage.from_("images").upload(file_path, content, file_options={"content-type": file.content_type})
         )
 
-        # create signed url
-        try:
-            signed_url_res = await asyncio.to_thread(
-                lambda: supabase.storage.from_("images").create_signed_url(file_path, expires_in=3600)
-            )
-            # Supabase kütüphane versiyonuna göre 'signedURL' veya 'signed_url' dönebilir
-            image_url = signed_url_res.get("signedURL") or signed_url_res.get("signed_url")
-            if not image_url:
-                raise Exception("Signed URL generation returned empty.")
-        except Exception as url_err:
-            logger.error(f"action=signed_url_generation_failed | request_id={request_id}", exc_info=True)
-            raise HTTPException(status_code=500, detail={"code": "URL_GENERATION_ERROR", "message": "Secure image access could not be generated."})
-
         # db insert
         db_data = {
             "user_id": active_client_id,
-            "image_url": image_url,
+            "image_path": file_path,
             "genai_score": genai_score,
             "deepfake_score": deepfake_score,
             "authenticity_score": authenticity_score,
@@ -1078,13 +1065,25 @@ async def get_history(auth = Depends(management_rate_limiter)):
 
         clean_history = []
         for log in response.data:
+            current_image_url = None
+            saved_path = log.get("image_path")
+            if saved_path and not log.get("purged_at") and not log.get("deleted_at"):
+                try:
+                    signed_res = await asyncio.to_thread(
+                        lambda p=saved_path: supabase.storage.from_("images").create_signed_url(p, expires_in=3600)
+                    )
+                    current_image_url = signed_res.get("signedURL") or signed_res.get("signed_url")
+                except Exception:
+                    current_image_url = None
+
             # label üzerinden ANALYSIS_MAP'teki karşılığını bul
             decision = next((val for val in ANALYSIS_MAP.values() if val["label"] == log.get("label")), None)
             
             item = {
                 "id": log.get("id"),
-                "image_url": log.get("image_url"),
+                "image_url": current_image_url,
                 "purged_at": log.get("purged_at"),
+                "purge_reason": log.get("purge_reason"),
                 "authenticity_score": log.get("authenticity_score"),
                 "verdict": {
                     "risk_level": log.get("risk_level"),
@@ -1126,7 +1125,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
     try:
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("image_url")
+            .select("image_path, deleted_at")
             .eq("id", analysis_id)
             .eq("user_id", active_client_id)
             .execute()
@@ -1136,24 +1135,32 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
             raise HTTPException(status_code=404, detail="Analysis record not found.")
             
         log = res.data[0]
-        image_url = log.get("image_url")
 
-        if image_url:
+        if log.get("deleted_at"):
+            raise HTTPException(status_code=400, detail="Analysis record is already deleted.")
+
+        image_path = log.get("image_path")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        update_data = {
+            "deleted_at": now_iso
+        }
+
+        if image_path:
+            # görsel daha önceden silinmemişse bu alanları güncelle, silinmiş ise olduğu gibi bırak
+            update_data["image_path"] = None
+            update_data["purged_at"] = now_iso
+            update_data["purge_reason"] = "user_delete_analysis_request"
+
             try:
-                file_path = image_url.split("/images/")[1]
                 await asyncio.to_thread(
-                    lambda: supabase.storage.from_("images").remove([file_path])
+                    lambda p=image_path: supabase.storage.from_("images").remove([p])
                 )
             except Exception as e:
                 logger.error(f"action=physical_image_delete_failed | analysis_id={analysis_id} | error={str(e)}")
 
-        now_iso = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .update({
-                "image_url": None,
-                "deleted_at": now_iso
-            })
+            .update(update_data)
             .eq("id", analysis_id)
             .execute()
         )
@@ -1161,7 +1168,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
         logger.info(f"action=analysis_soft_deleted | analysis_id={analysis_id} | user_id={active_client_id}")
         return {
             "status": "success", 
-            "message": "Analysis record and associated image have been removed."
+            "message": "Analysis record" + (" and associated image" if image_path else "") + " have been removed."
         }
 
     except HTTPException:
@@ -1174,7 +1181,7 @@ async def delete_full_analysis(analysis_id: str, auth = Depends(management_rate_
 @app.delete("/history/{analysis_id}/image")
 async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate_limiter)):
     active_client_id = auth["id"]
-    
+
     if auth.get("auth_type") == "api_key":
         logger.warning(f"action=image_delete_rejected | reason=invalid_auth_method | user_id={active_client_id}")
         raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
@@ -1183,7 +1190,7 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
         # Kaydı bul ve sahipliği kontrol et
         res = await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .select("image_url, user_id")
+            .select("image_path, user_id")
             .eq("id", analysis_id)
             .eq("user_id", active_client_id)
             .execute()
@@ -1193,27 +1200,24 @@ async def delete_analysis_image(analysis_id: str, auth = Depends(management_rate
             raise HTTPException(status_code=404, detail="Analysis record not found.")
             
         log = res.data[0]
+        image_path = log.get("image_path")
 
-        if not log.get("image_url"):
+        if not image_path:
             return {"status": "ignored", "message": "Image already deleted."}
-
-        # URL'den Storage dosya yolunu ayıkla
-        try:
-            image_url = log["image_url"]
-            file_path = image_url.split("/images/")[1]
-        except Exception:
-            logger.error(f"action=image_url_parse_failed | analysis_id={analysis_id} | url={image_url}")
-            raise HTTPException(status_code=500, detail="Could not parse image path.")
 
         # Storage'dan dosyayı fiziksel olarak sil
         await asyncio.to_thread(
-            lambda: supabase.storage.from_("images").remove([file_path])
+            lambda: supabase.storage.from_("images").remove([image_path])
         )
-
-        # SADECE image_url'i null yap, purged_at Cron Job'a bırakıldı
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(
             lambda: supabase.table("analysis_history")
-            .update({"image_url": None})
+            .update({
+                "image_path": None,
+                "purged_at": now_iso,
+                "purge_reason": "user_delete_image_request"
+            })
             .eq("id", analysis_id)
             .execute()
         )
