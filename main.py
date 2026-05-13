@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from openai import AsyncOpenAI
 
 # security
-MIN_FILE_SIZE = 50 * 1024 # 50 KB (trash)
+MIN_FILE_SIZE = 10 * 1024 # 10 KB (trash)
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"]
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -314,23 +314,59 @@ async def call_vlm(image_content: bytes) -> dict:
         "openai_request_id": response.id
     }
 
-async def has_human_face(image_bytes: bytes) -> bool:
+# quality control functions
+def decode_image(image_bytes: bytes):
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+def check_resolution(img_matrix, min_width=512, min_height=512) -> dict:
+    height, width = img_matrix.shape[:2]
+    if width < min_width or height < min_height:
+        return {"is_valid": False, "error_code": "LOW_RESOLUTION", "message": f"Resolution too low ({width}x{height}). Minimum required is {min_width}x{min_height}."}
+    return {"is_valid": True}
+
+def check_blur(img_matrix, blur_threshold=35.0) -> dict:
+    gray = cv2.cvtColor(img_matrix, cv2.COLOR_BGR2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if variance < blur_threshold:
+        return {"is_valid": False, "error_code": "BLURRY_IMAGE", "message": "Image is too blurry for reliable analysis."}
+    return {"is_valid": True}
+
+def check_exposure(img_matrix, dark_thresh=20, bright_thresh=235) -> dict:
+    gray = cv2.cvtColor(img_matrix, cv2.COLOR_BGR2GRAY)
+    mean_brightness = np.mean(gray)
+    if mean_brightness < dark_thresh:
+        return {"is_valid": False, "error_code": "TOO_DARK", "message": "Image is too dark for analysis."}
+    if mean_brightness > bright_thresh:
+        return {"is_valid": False, "error_code": "TOO_BRIGHT", "message": "Image is overexposed."}
+    return {"is_valid": True}
+
+def validate_image_quality(img_matrix) -> dict:
+    if img_matrix is None:
+        return {"is_valid": False, "error_code": "UNPROCESSABLE_IMAGE", "message": "Image could not be decoded."}
+        
+    # çözünürlük
+    res_check = check_resolution(img_matrix)
+    if not res_check.get("is_valid"): return res_check
+        
+    # pozlama: karanlık ve parlaklık
+    exp_check = check_exposure(img_matrix)
+    if not exp_check.get("is_valid"): return exp_check
+    
+    # bulanıklık
+    blur_check = check_blur(img_matrix)
+    if not blur_check.get("is_valid"): return blur_check
+        
+    return {"is_valid": True, "error_code": None, "message": None}
+
+async def check_human_face(img_matrix) -> dict:
     """
         Numpy 2.0+ ve en güncel MediaPipe sürümleriyle uyumlu, 
         'image_ptr' hatasını engelleyen modern implementasyon.
     """
-    try:
-        # byte verisini Numpy dizisine çevir
-        # .copy() eklenmezse MediaPipe '_image_ptr' hatası fırlatır.
-        nparr = np.frombuffer(image_bytes, np.uint8).copy()
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            logger.warning("action=image_decode_failed | reason=cv2_imdecode_returned_none")
-            return False
-            
+    try:    
         # MediaPipe RGB formatı bekler
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_rgb = cv2.cvtColor(img_matrix, cv2.COLOR_BGR2RGB)
         # KRİTİK ADIM: Numpy dizisinin hafıza düzenini (memory layout) zorla düzeltiyoruz
         # Bu satır, MediaPipe'ın beklediği C-style hafıza dizilimini garanti eder.
         img_rgb = np.ascontiguousarray(img_rgb)
@@ -340,11 +376,15 @@ async def has_human_face(image_bytes: bytes) -> bool:
         
         # CPU bloklanmasını önlemek için asenkron thread kullan
         detection_result = await asyncio.to_thread(face_detector.detect, mp_image)
-    
-        # Sonuçlarda yüz var mı kontrol et
-        if len(detection_result.detections) > 0:
-            return True
-        return False
+        print(detection_result) # debug için ekledim, kaldırabilirsin
+        face_count = len(detection_result.detections) if detection_result.detections else 0
+
+        if face_count == 0:
+            return {"is_valid": False, "error_code": "FACE_NOT_DETECTED", "message": "No valid human face found in the image."}
+        elif face_count > 1:
+            return {"is_valid": False, "error_code": "MULTIPLE_FACES_DETECTED", "message": "Multiple faces detected. Please upload an image with a single person."}
+            
+        return {"is_valid": True, "error_code": None, "message": None}
         
     except Exception as e:
         logger.error("action=face_detection_engine_failed", exc_info=True)
@@ -706,7 +746,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "FILE_TOO_SMALL", "File size is below minimum limit.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "FILE_TOO_SMALL", "message": f"file is too small: min size is {MIN_FILE_SIZE}KB"}
+            detail={"code": "FILE_TOO_SMALL", "message": f"file is too small: min size is {MIN_FILE_SIZE / 1024}KB"}
         )
 
     if not is_test_mode:
@@ -722,9 +762,36 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
 
     try:
         content = await file.read()
+        img_matrix = decode_image(content)
         
+        # checkpoint 1: image quality control
+        quality_check = validate_image_quality(img_matrix)
+        if not quality_check["is_valid"]:
+            logger.warning(f"action=analysis_rejected | reason={quality_check['error_code'].lower()} | user_id={active_client_id}")
+            await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", quality_check["error_code"], quality_check["message"])
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "request_id": request_id,
+                    "status": "failed",
+                    "error": {
+                        "code": quality_check["error_code"],
+                        "message": quality_check["message"],
+                        "recommendation": "Please ensure the image is clear, well-lit, and high resolution."
+                    },
+                    "meta": {
+                        "credits_used": 0,
+                        "credits_deducted": False,
+                        "credits_remaining": profile_data.get("credits", 0),
+                        "mode": "test" if is_test_mode else "live",
+                        "processing_time_ms": int((time.time() - start_time) * 1000)
+                    }
+                }
+            )
+
+        # checkpoint 2: human face check
         try:
-            is_human = await has_human_face(content)
+            face_check = await check_human_face(img_matrix)
         except Exception as face_err:
             logger.error(f"action=face_detection_failed | request_id={request_id}", exc_info=True)
             raise HTTPException(
@@ -732,26 +799,28 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 detail={"code": "FACE_DETECTION_ERROR", "message": "Face detection service temporarily unavailable. No credits deducted."}
             )
 
-        # checkpoint 1: a human face check
-        if not is_human:
-            logger.warning(f"action=analysis_rejected | reason=face_not_detected | request_id={request_id} | user_id={active_client_id}")
-            await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", "FACE_NOT_DETECTED", "No valid human face found in the image.")
-            return {
-                "request_id": request_id,
-                "status": "failed",
-                "error": {
-                    "code": "FACE_NOT_DETECTED",
-                    "message": "Analysis could not be started: No valid human face found in the image.",
-                    "recommendation": "Please upload a clear photo of a single person. Group photos or distant shots may cause inaccurate results."
-                },
-                "meta": {
-                    "credits_used": 0,
-                    "credits_deducted": False,
-                    "credits_remaining": profile_data.get("credits", 0), # no credits used
-                    "mode": "test" if is_test_mode else "live",
-                    "processing_time_ms": int((time.time() - start_time) * 1000)
+        if not face_check["is_valid"]:
+            logger.warning(f"action=analysis_rejected | reason={face_check['error_code'].lower()} | request_id={request_id} | user_id={active_client_id}")
+            await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", face_check["error_code"], face_check["message"])
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "request_id": request_id,
+                    "status": "failed",
+                    "error": {
+                        "code": face_check["error_code"],
+                        "message": face_check["message"],
+                        "recommendation": "Please upload a clear photo of a single person. Group photos or distant shots may cause inaccurate results."
+                    },
+                    "meta": {
+                        "credits_used": 0,
+                        "credits_deducted": False,
+                        "credits_remaining": profile_data.get("credits", 0), # no credits used
+                        "mode": "test" if is_test_mode else "live",
+                        "processing_time_ms": int((time.time() - start_time) * 1000)
+                    }
                 }
-            }
+            )
 
         # ---- TEST MODE ----
         if is_test_mode:
