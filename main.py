@@ -426,7 +426,7 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
                 )
 
             user_id = user_response.user.id
-            auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt"}
+            auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt", "provider": user_response.user.app_metadata.get("provider")}
             logger.info(f"action=auth_success | auth_type=jwt | user_id={user_id}")
         except Exception as e:
             logger.warning(f"action=auth_failed | reason=invalid_jwt | error={str(e)}")
@@ -1293,7 +1293,9 @@ async def get_me(auth = Depends(management_rate_limiter)):
         logger.warning(f"action=profile_fetch_rejected | reason=invalid_auth_method | user_id={user_id}")
         raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot use for this endpoint. Please use jwt access."})
     
-    return auth.get("profile", {})
+    profile = auth.get("profile", {})
+    profile["app_metadata"] = {"provider": auth.get("provider")}
+    return profile
 
 # X-signature
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
