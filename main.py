@@ -417,6 +417,14 @@ async def get_auth_user(api_key: str = Depends(api_key_header), credentials: HTT
             user_response = await asyncio.to_thread(
                 lambda: supabase.auth.get_user(credentials.credentials)
             )
+
+            if not user_response.user.email_confirmed_at:
+                logger.warning(f"action=auth_failed | reason=email_not_confirmed | user_id={user_response.user.id}")
+                raise HTTPException(
+                    status_code=403, 
+                    detail={"code": "EMAIL_NOT_CONFIRMED", "message": "Please confirm your email address to use the API."}
+                )
+
             user_id = user_response.user.id
             auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt"}
             logger.info(f"action=auth_success | auth_type=jwt | user_id={user_id}")
@@ -1262,7 +1270,14 @@ def login(user: UserLogin):
             "token_type": "bearer",
             "is_allowed": is_allowed
         }
-    except AuthApiError:
+    except AuthApiError as e:
+        error_msg = str(e)
+        if "Email not confirmed" in error_msg:
+            logger.warning(f"action=login_failed | reason=email_not_confirmed | email={user.email}")
+            raise HTTPException(
+                status_code=401, 
+                detail={"code": "EMAIL_NOT_CONFIRMED", "message": "Please confirm your email address before logging in."}
+            )
         logger.warning(f"action=login_failed | reason=invalid_credentials | email={user.email}")
         raise HTTPException(status_code=401, detail={"code": "INVALID_CREDENTIALS", "message": "Invalid email or password."})
     except Exception as e:
