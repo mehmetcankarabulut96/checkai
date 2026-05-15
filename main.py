@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64, logging, sys
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64, logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -161,7 +161,7 @@ VLM_EXPLANATION_MAP = {
     "SYNTHETIC_ARTIFACTS": "AI-specific texture artifacts and hallucinations"
 }
 
-app = FastAPI(title="checkai b2b api", version="1.0.0")
+app = FastAPI(title="api.cludek.com", version="1.0.0")
 
 load_dotenv()
 
@@ -181,7 +181,12 @@ logger.info("action=logger_init | status=render_logs_ready")
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # cors
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+origins = [
+    "https://cludek.com",
+    "http://localhost:3000",  # vite local development
+    "http://127.0.0.1:3000",
+]
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # Sightengine cradentials
 SIGHTENGINE_USER = os.getenv("SIGHTENGINE_USER")
