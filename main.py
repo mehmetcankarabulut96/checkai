@@ -183,8 +183,9 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # cors
 origins = [
     "https://cludek.com",
-    "http://localhost:3000",  # vite local development
-    "http://127.0.0.1:3000",
+    "http://localhost:5173",  # vide default port
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",  # other development ports
 ]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
