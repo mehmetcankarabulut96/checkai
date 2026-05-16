@@ -1437,8 +1437,10 @@ async def lemon_squeezy_webhook(request: Request):
         elif event_name == 'subscription_payment_success':
             if billing_reason == 'initial':
                 logger.info(f"action=webhook_ignored | reason=initial_payment_handled | user_id={user_id}")
+                return {"status": "ignored", "reason": "Initial payment handled by subscription_created"}
             elif db_plan_type == "free":
                 logger.info(f"action=webhook_ignored | reason=free_plan_payment | user_id={user_id}")
+                return {"status": "ignored", "reason": "Free plan payment success ignored"}
             else:
                 if target_plan == "business":
                     raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
