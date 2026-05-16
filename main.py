@@ -1,5 +1,5 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, logging, base64, logging
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, base64, logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
@@ -282,7 +282,8 @@ async def call_vlm(image_content: bytes) -> dict:
                 ]}
             ],
             max_tokens=200,
-            temperature=0.0 # Sabit ve tutarlı skorlar için 0 (sıfır) olmalı
+            temperature=0.0, # Sabit ve tutarlı skorlar için 0 (sıfır) olmalı
+            timeout=15.0 # 15 saniyelik timeout, bu süre aşılırsa istisna fırlatır
         )
         
         # response
@@ -483,7 +484,9 @@ async def auth_rate_limiter(request: Request):
         
         # 60 saniyeden eski kayıtları temizle
         AUTH_RATE_LIMIT_STORAGE[ip] = [t for t in AUTH_RATE_LIMIT_STORAGE[ip] if now - t < 60.0]
-        
+        if not AUTH_RATE_LIMIT_STORAGE[ip]:
+            del AUTH_RATE_LIMIT_STORAGE[ip]
+
         if len(AUTH_RATE_LIMIT_STORAGE[ip]) >= AUTH_LIMIT_PER_MINUTE:
             logger.warning(f"action=rate_limit_exceeded | type=auth_ip | ip={ip}")
             raise HTTPException(
@@ -504,7 +507,9 @@ async def management_rate_limiter(auth = Depends(get_auth_user)):
         
         # Son 60 saniyeyi tut
         MGMT_RATE_LIMIT_STORAGE[user_id] = [t for t in MGMT_RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
-        
+        if not MGMT_RATE_LIMIT_STORAGE[user_id]:
+            del MGMT_RATE_LIMIT_STORAGE[user_id]
+
         if len(MGMT_RATE_LIMIT_STORAGE[user_id]) >= MGMT_LIMIT_PER_MINUTE:
             logger.warning(f"action=rate_limit_exceeded | type=management | user_id={user_id}")
             raise HTTPException(
@@ -539,6 +544,9 @@ async def rate_limiter(auth = Depends(get_auth_user)):
         
         # Temizlik: 60 saniyeden eski tüm istekleri bellekten at
         RATE_LIMIT_STORAGE[user_id] = [t for t in RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
+        if not RATE_LIMIT_STORAGE[user_id]:
+            del RATE_LIMIT_STORAGE[user_id]
+
         all_requests = RATE_LIMIT_STORAGE[user_id]
 
         # A. Saniyelik Kontrol (Son 1 saniye)
@@ -698,7 +706,7 @@ async def list_api_keys(current_user = Depends(management_rate_limiter)):
 
 # jwt
 @app.delete("/api-keys/{key_id}")
-async def delete_api_key(key_id: str, current_user = Depends(rate_limiter)):
+async def delete_api_key(key_id: str, current_user = Depends(management_rate_limiter)):
     user_id = current_user["id"]
     
     if current_user.get("auth_type") == "api_key":
@@ -1074,6 +1082,7 @@ async def get_history(auth = Depends(management_rate_limiter)):
                 .eq("user_id", active_client_id) \
                 .is_("deleted_at", "null") \
                 .order("created_at", desc=True) \
+                .limit(100) \
                 .execute()
         )
 
@@ -1333,6 +1342,7 @@ async def lemon_squeezy_webhook(request: Request):
     attributes = payload.get("data", {}).get("attributes", {})
     variant_id = str(attributes.get("variant_id"))
     billing_reason = attributes.get("billing_reason")
+    sub_status = attributes.get("status")
 
     # BÖCEK AVI
     logger.info(f"action=webhook_received | event={event_name} | variant={variant_id} | user_id={user_id}")
@@ -1346,83 +1356,127 @@ async def lemon_squeezy_webhook(request: Request):
         now_iso = datetime.now(timezone.utc).isoformat()
         update_data = {}
 
-        # 1. Yeni kayıt, paket yükseltme/düşürme veya aylık yenileme (Krediyi ve Günlük Kullanımı setler)
-        if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
-            # Durum A: Variant ID varsa (Yeni Abonelik / Paket Değişimi)
-            if variant_id in [LITE_VARIANT_ID, PRO_VARIANT_ID, BUSINESS_VARIANT_ID]:
-                if variant_id == LITE_VARIANT_ID: 
-                    plan_type = "lite"
-                    credits = MONTHLY_LIMITS.get(plan_type)
-                elif variant_id == PRO_VARIANT_ID: 
-                    plan_type = "pro"
-                    credits = MONTHLY_LIMITS.get(plan_type)
-                elif variant_id == BUSINESS_VARIANT_ID:
-                    plan_type = "business"
-                    credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
-                    # Business'a özel limitleri custom_data'dan çek ve ekle
-                    update_data.update({
-                        "custom_rate_limit": custom_data.get("custom_rate_limit"),
-                        "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
-                        "custom_daily_limit": custom_data.get("custom_daily_limit"),
-                        "custom_key_limit": custom_data.get("custom_key_limit")
-                    })
+        # Mevcut veritabanı durumunu çek (Gerçek bir paket değişimi olup olmadığını anlamak için)
+        db_profile = await asyncio.to_thread(
+            lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
+        )
+        db_plan_type = (db_profile.data or {}).get("plan_type", "free")
 
-            # Durum B: Variant ID yok ama Ödeme Başarılı ise (Aylık Düzenli Yenileme)
-            elif event_name == 'subscription_payment_success':
-                # İlk satın alma işleminde krediler subscription_created ile verildiği için bunu yoksay
-                if billing_reason == 'initial':
-                    logger.info(f"action=webhook_ignored | reason=initial_payment_handled | user_id={user_id}")
-                    return {"status": "ignored", "reason": "Initial payment handled by subscription_created"}
-                
-                db_profile = await asyncio.to_thread(
-                    lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
-                )
-                profile_data = db_profile.data or {}
-                plan_type = profile_data.get("plan_type", "free")
-                
-                if plan_type == "free":
-                    logger.info(f"action=webhook_ignored | reason=free_plan_payment | user_id={user_id}")
-                    return {"status": "ignored", "reason": "Free plan payment success ignored"}
-        
-                if plan_type == "business":
-                    credits = int(custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT))
-                else:
-                    credits = MONTHLY_LIMITS.get(plan_type)
+        # Gelen variant_id'ye göre hedef paketi belirle
+        target_plan = "free"
+        if variant_id == LITE_VARIANT_ID: target_plan = "lite"
+        elif variant_id == PRO_VARIANT_ID: target_plan = "pro"
+        elif variant_id == BUSINESS_VARIANT_ID: target_plan = "business"
 
-            # Durum C: Variant ID yok ve ödeme başarılı eventi değilse
+        # --- EVENT YÖNETİMİ ---
+        # A. Yeni Abonelik (İlk Satın Alım)
+        if event_name == "subscription_created":
+            if target_plan == "business":
+                raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
+                try:
+                    credits = int(raw_credits)
+                except (ValueError, TypeError):
+                    credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
+
+                update_data = {
+                    "plan_type": target_plan,
+                    "credits": credits,
+                    "daily_usage": 0,
+                    "last_daily_usage_reset": now_iso,
+                    "custom_rate_limit": custom_data.get("custom_rate_limit"),
+                    "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
+                    "custom_daily_limit": custom_data.get("custom_daily_limit"),
+                    "custom_key_limit": custom_data.get("custom_key_limit")
+                }
             else:
-                logger.warning(f"action=webhook_skipped | reason=unknown_variant | event={event_name} | variant={variant_id} | user_id={user_id}")
-                return {"status": "ignored", "reason": "Missing or unknown variant_id"}
+                update_data = {
+                    "plan_type": target_plan,
+                    "credits": MONTHLY_LIMITS.get(target_plan),
+                    "daily_usage": 0,
+                    "last_daily_usage_reset": now_iso
+                }
+        
+        # B. Abonelik Güncellenmesi (Kart değişimi, İptal, Upgrade/Downgrade, Resume)
+        elif event_name == 'subscription_updated':
+            if sub_status in ['past_due', 'unpaid']:
+                # Kredi kartından para çekilemedi, free'ye düşür ve kredileri sıfırla
+                update_data = {
+                    "plan_type": "free", 
+                    "credits": 0, 
+                    "daily_usage": 0,
+                    "last_daily_usage_reset": now_iso
+                }
+            elif sub_status == 'canceled':
+                # İptal edildi, sadece plan tipini koru, krediler olduğu gibi kalır
+                update_data = {"plan_type": target_plan}
+            elif sub_status in ['active']:
+                # Sadece gerçek bir paket değişikliği varsa (Upgrade/Downgrade) kredileri yenile
+                if target_plan != db_plan_type and target_plan != "free":
+                    if target_plan == "business":
+                        raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
+                        try:
+                            credits = int(raw_credits)
+                        except (ValueError, TypeError):
+                            credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
+
+                        update_data = {
+                            "plan_type": target_plan,
+                            "credits": credits,
+                            "daily_usage": 0,
+                            "last_daily_usage_reset": now_iso,
+                            "custom_rate_limit": custom_data.get("custom_rate_limit"),
+                            "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
+                            "custom_daily_limit": custom_data.get("custom_daily_limit"),
+                            "custom_key_limit": custom_data.get("custom_key_limit")
+                        }
+                    else:
+                        update_data = {
+                            "plan_type": target_plan,
+                            "credits": MONTHLY_LIMITS.get(target_plan),
+                            "daily_usage": 0,
+                            "last_daily_usage_reset": now_iso
+                        }
+                else:
+                    # Paket aynı (sadece kart değişti veya iptalden vazgeçildi). Kredi olduğu gibi kalır
+                    update_data = {"plan_type": target_plan}
+
+        # C. Aylık Düzenli Yenileme (Başarılı Tahsilat)
+        elif event_name == 'subscription_payment_success':
+            if billing_reason == 'initial':
+                logger.info(f"action=webhook_ignored | reason=initial_payment_handled | user_id={user_id}")
+            elif db_plan_type == "free":
+                logger.info(f"action=webhook_ignored | reason=free_plan_payment | user_id={user_id}")
+            else:
+                if target_plan == "business":
+                    raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
+                    try:
+                        credits = int(raw_credits)
+                    except (ValueError, TypeError):
+                        credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
+                else:
+                    credits = MONTHLY_LIMITS.get(target_plan)
+
+                update_data = {
+                    "plan_type": target_plan,
+                    "credits": credits,
+                    "daily_usage": 0,
+                    "last_daily_usage_reset": now_iso
+                }
+        
+        # D. Ödeme Başarısız / Süre Bitti / İade Edildi
+        elif event_name in ['subscription_expired', 'subscription_payment_failed', 'order_refunded']:
+            # Süre bitimi (expired) dışında, başarısız/iade durumlarda sıfır kredi verilir
+            assigned_credits = MONTHLY_LIMITS.get("free") if event_name == 'subscription_expired' else 0
             
-            # Ortak güncellenecek alanları update_data'ya ekle
-            update_data.update({
-                "plan_type": plan_type,
-                "credits": credits,
-                "daily_usage": 0,
-                "last_daily_usage_reset": now_iso
-            })
-            
-        # 2. Abonelik süresi tamamen bittiğinde (Free plana düşürür)
-        elif event_name == 'subscription_expired':
             update_data = {
                 "plan_type": "free",
-                "credits": MONTHLY_LIMITS.get("free"),
+                "credits": assigned_credits,
                 "daily_usage": 0,
                 "last_daily_usage_reset": now_iso,
-                # Business'tan düşüyorsa özel limitleri temizle (isteğe bağlı)
                 "custom_rate_limit": None,
                 "custom_rate_limit_min": None,
                 "custom_daily_limit": None,
                 "custom_key_limit": None
-            }
-
-        # 3. İade veya İptal durumunda
-        elif event_name in ['order_refunded']:
-            update_data = {
-                "plan_type": "free",
-                "credits": 0,
-                "daily_usage": 0,
-                "last_daily_usage_reset": now_iso
             }
         
         # Hazırlanan update_data'yı veritabanına gönder
