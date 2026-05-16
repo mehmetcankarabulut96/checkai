@@ -168,7 +168,8 @@ load_dotenv()
 # logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(name)s - %(message)s")
+logger.propagate = False
+formatter = logging.Formatter("[%(levelname)s] - %(asctime)s - %(name)s - %(message)s")
 
 # console logger for development and debugging
 console_handler = logging.StreamHandler()
@@ -479,22 +480,21 @@ async def auth_rate_limiter(request: Request):
     ip = request.client.host
     async with RATE_LIMIT_LOCK:
         now = time.time()
-        if ip not in AUTH_RATE_LIMIT_STORAGE:
-            AUTH_RATE_LIMIT_STORAGE[ip] = []
-        
-        # 60 saniyeden eski kayıtları temizle
-        AUTH_RATE_LIMIT_STORAGE[ip] = [t for t in AUTH_RATE_LIMIT_STORAGE[ip] if now - t < 60.0]
-        if not AUTH_RATE_LIMIT_STORAGE[ip]:
-            del AUTH_RATE_LIMIT_STORAGE[ip]
 
-        if len(AUTH_RATE_LIMIT_STORAGE[ip]) >= AUTH_LIMIT_PER_MINUTE:
+        history = AUTH_RATE_LIMIT_STORAGE.get(ip, [])
+
+        # 60 saniyeden eski kayıtları temizle
+        history = [t for t in history if now - t < 60.0]
+
+        if len(history) >= AUTH_LIMIT_PER_MINUTE:
             logger.warning(f"action=rate_limit_exceeded | type=auth_ip | ip={ip}")
             raise HTTPException(
                 status_code=429, 
                 detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many attempts. Please try again in a minute."}
             )
             
-        AUTH_RATE_LIMIT_STORAGE[ip].append(now)
+        history.append(now)
+        AUTH_RATE_LIMIT_STORAGE[ip] = history
 
 # arayüz gezintisi için rate limiter
 async def management_rate_limiter(auth = Depends(get_auth_user)):
@@ -502,23 +502,21 @@ async def management_rate_limiter(auth = Depends(get_auth_user)):
     
     async with RATE_LIMIT_LOCK:
         now = time.time()
-        if user_id not in MGMT_RATE_LIMIT_STORAGE:
-            MGMT_RATE_LIMIT_STORAGE[user_id] = []
-        
-        # Son 60 saniyeyi tut
-        MGMT_RATE_LIMIT_STORAGE[user_id] = [t for t in MGMT_RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
-        if not MGMT_RATE_LIMIT_STORAGE[user_id]:
-            del MGMT_RATE_LIMIT_STORAGE[user_id]
 
-        if len(MGMT_RATE_LIMIT_STORAGE[user_id]) >= MGMT_LIMIT_PER_MINUTE:
+        history = MGMT_RATE_LIMIT_STORAGE.get(user_id, [])
+        # Son 60 saniyeyi tut
+        history = [t for t in history if now - t < 60.0]
+
+        if len(history) >= MGMT_LIMIT_PER_MINUTE:
             logger.warning(f"action=rate_limit_exceeded | type=management | user_id={user_id}")
             raise HTTPException(
                 status_code=429, 
                 detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Too many dashboard requests. Please slow down."}
             )
             
-        MGMT_RATE_LIMIT_STORAGE[user_id].append(now)
-        
+        history.append(now)
+        MGMT_RATE_LIMIT_STORAGE[user_id] = history
+
     return auth
 
 # planlara özel rate limiter
@@ -539,29 +537,24 @@ async def rate_limiter(auth = Depends(get_auth_user)):
     async with RATE_LIMIT_LOCK:
         now = time.time()
 
-        if user_id not in RATE_LIMIT_STORAGE:
-            RATE_LIMIT_STORAGE[user_id] = []
-        
+        history = RATE_LIMIT_STORAGE.get(user_id, [])
         # Temizlik: 60 saniyeden eski tüm istekleri bellekten at
-        RATE_LIMIT_STORAGE[user_id] = [t for t in RATE_LIMIT_STORAGE[user_id] if now - t < 60.0]
-        if not RATE_LIMIT_STORAGE[user_id]:
-            del RATE_LIMIT_STORAGE[user_id]
-
-        all_requests = RATE_LIMIT_STORAGE[user_id]
+        history = [t for t in history if now - t < 60.0]
 
         # A. Saniyelik Kontrol (Son 1 saniye)
-        requests_last_sec = [t for t in all_requests if now - t < 1.0]
+        requests_last_sec = [t for t in history if now - t < 1.0]
         if len(requests_last_sec) >= sec_limit:
             logger.warning(f"action=rate_limit_exceeded | type=api_second | limit={sec_limit} | user_id={user_id}")
             raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": "Rate limit (seconds) exceeded."})
         
         # B. Dakikalık Kontrol (Son 60 saniye)
-        if len(all_requests) >= minute_limit:
+        if len(history) >= minute_limit:
             logger.warning(f"action=rate_limit_exceeded | type=api_minute | limit={minute_limit} | user_id={user_id}")
             raise HTTPException(status_code=429, detail={"code": "RATE_LIMIT_EXCEEDED", "message": f"Exceeded minute limit: ({minute_limit} req/min)."})
             
         # İstek başarılı, zaman damgasını ekle
-        RATE_LIMIT_STORAGE[user_id].append(now)
+        history.append(now)
+        RATE_LIMIT_STORAGE[user_id] = history
 
     # Endpoint'in kullanması için auth datayı geri dön
     return auth
