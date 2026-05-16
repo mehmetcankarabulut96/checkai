@@ -1397,7 +1397,11 @@ async def lemon_squeezy_webhook(request: Request):
                     "plan_type": "free", 
                     "credits": 0, 
                     "daily_usage": 0,
-                    "last_daily_usage_reset": now_iso
+                    "last_daily_usage_reset": now_iso,
+                    "custom_rate_limit": None,
+                    "custom_rate_limit_min": None,
+                    "custom_daily_limit": None,
+                    "custom_key_limit": None
                 }
             elif sub_status == 'canceled':
                 # İptal edildi, sadece plan tipini koru, krediler olduğu gibi kalır
