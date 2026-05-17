@@ -1403,7 +1403,7 @@ async def lemon_squeezy_webhook(request: Request):
                     "custom_daily_limit": None,
                     "custom_key_limit": None
                 }
-            elif sub_status == 'canceled':
+            elif sub_status == 'cancelled':
                 # İptal edildi, sadece plan tipini koru, krediler olduğu gibi kalır
                 update_data = {"plan_type": target_plan}
             elif sub_status in ['active']:
