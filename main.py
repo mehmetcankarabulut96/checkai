@@ -1075,7 +1075,6 @@ async def get_history(auth = Depends(management_rate_limiter)):
                 .eq("user_id", active_client_id) \
                 .is_("deleted_at", "null") \
                 .order("created_at", desc=True) \
-                .limit(100) \
                 .execute()
         )
 
