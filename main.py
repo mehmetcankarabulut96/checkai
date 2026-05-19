@@ -1309,6 +1309,87 @@ async def health_check():
     """Frontend dashboard alanının sistem durumunu takip ettiği açık endpoint."""
     return {"status": "operational", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+# jwt
+@app.delete("/account")
+async def delete_account(auth = Depends(management_rate_limiter)):
+    active_client_id = auth["id"]
+    
+    if auth.get("auth_type") == "api_key":
+        logger.warning(f"action=account_delete_rejected | reason=invalid_auth_method | user_id={active_client_id}")
+        raise HTTPException(status_code=403, detail={"code": "API_KEY_RESTRICTED", "message": "API keys cannot be used for this endpoint. Please use JWT access."})
+
+    # Lemon Squeezy Abonelik İptali
+    try:
+        user_auth_info = await asyncio.to_thread(
+            lambda: supabase.auth.admin.get_user_by_id(active_client_id)
+        )
+        user_email = user_auth_info.user.email
+
+        if user_email:
+            ls_api_key = os.getenv("LEMON_SQUEEZY_API_KEY")
+            headers = {
+                "Accept": "application/vnd.api+json",
+                "Content-Type": "application/vnd.api+json",
+                "Authorization": f"Bearer {ls_api_key}"
+            }
+            
+            ls_response = await http_client.get(
+                f"https://api.lemonsqueezy.com/v1/subscriptions?filter[user_email]={user_email}",
+                headers=headers
+            )
+            
+            if ls_response.status_code == 200:
+                ls_data = ls_response.json().get("data", [])
+                for sub in ls_data:
+                    sub_id = sub.get("id")
+                    if sub.get("attributes", {}).get("status") in ["active", "paused", "past_due"]:
+                        cancel_res = await http_client.delete(
+                            f"https://api.lemonsqueezy.com/v1/subscriptions/{sub_id}",
+                            headers=headers
+                        )
+                        # API'ye ulaşıldı ama iptal reddedildi
+                        if cancel_res.status_code != 200:
+                            logger.error(f"action=account_delete_ls_cancel_failed | sub_id={sub_id} | status={cancel_res.status_code}")
+                            raise HTTPException(status_code=500, detail={"code": "SUBSCRIPTION_CANCEL_FAILED", "message": "Failed to cancel subscription. Operation aborted."})
+            else:
+                # Abonelikler listelenemedi
+                logger.error(f"action=account_delete_ls_fetch_failed | user_id={active_client_id} | status={ls_response.status_code}")
+                raise HTTPException(status_code=500, detail={"code": "SUBSCRIPTION_FETCH_FAILED", "message": "Cannot fetch subscriptions. Operation aborted."})
+    except HTTPException:
+        raise
+    except Exception as ls_err:
+        # API'ye hiç ulaşılamadı (Network hatası vb.)
+        logger.error(f"action=account_delete_ls_lookup_failed | user_id={active_client_id} | error={str(ls_err)}")
+        raise HTTPException(status_code=500, detail={"code": "PAYMENT_GATEWAY_ERROR", "message": "Payment gateway is currently unreachable. Please try again later."})
+
+    # Storage Temizliği
+    try:
+        folder_files = await asyncio.to_thread(
+            lambda: supabase.storage.from_("images").list(path=active_client_id)
+        )
+        if folder_files:
+            files_to_delete = [f"{active_client_id}/{f['name']}" for f in folder_files]
+            await asyncio.to_thread(
+                lambda: supabase.storage.from_("images").remove(files_to_delete)
+            )
+            logger.info(f"action=account_delete_storage_cleared | user_id={active_client_id} | file_count={len(files_to_delete)}")
+    except Exception as storage_err:
+        logger.error(f"action=account_delete_storage_failed_ignored | user_id={active_client_id} | error={str(storage_err)}")
+
+    # Supabase Auth Silme İşlemi, DB Cascade ve Set Null tetiklenir
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.auth.admin.delete_user(active_client_id)
+        )
+        logger.info(f"action=account_deleted_successfully | user_id={active_client_id}")
+        return {
+            "status": "success", 
+            "message": "Account and all associated data have been permanently deleted."
+        }
+    except Exception as e:
+        logger.error(f"action=account_deletion_failed | user_id={active_client_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail={"code": "ACCOUNT_DELETION_ERROR", "message": "An internal error occurred while deleting your account."})
+
 # X-signature
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
