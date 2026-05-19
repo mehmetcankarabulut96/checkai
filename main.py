@@ -1304,6 +1304,11 @@ async def get_me(auth = Depends(management_rate_limiter)):
     profile["app_metadata"] = {"provider": auth.get("provider")}
     return profile
 
+@app.get("/health", status_code=status.HTTP_200_OK)
+async def health_check():
+    """Frontend dashboard alanının sistem durumunu takip ettiği açık endpoint."""
+    return {"status": "operational", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 # X-signature
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
