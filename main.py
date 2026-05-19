@@ -1438,7 +1438,8 @@ async def lemon_squeezy_webhook(request: Request):
         db_profile = await asyncio.to_thread(
             lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
         )
-        db_plan_type = (db_profile.data or {}).get("plan_type", "free")
+        profile_data = getattr(db_profile, "data", None) or {}
+        db_plan_type = profile_data.get("plan_type", "free")
 
         # Gelen variant_id'ye göre hedef paketi belirle
         target_plan = "free"
