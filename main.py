@@ -924,11 +924,11 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         authenticity_score = round(100.0 - max(genai_score, deepfake_score, safe_semantic_score), 2)
 
         # decision
-        if safe_semantic_score >= 80.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
-        elif deepfake_score >= 80.0: decision = ANALYSIS_MAP["DEEPFAKE"]
-        elif genai_score >= 85.0: decision = ANALYSIS_MAP["SYNTHETIC"]
+        if safe_semantic_score >= 70.0: decision = ANALYSIS_MAP["SEMANTIC_ANOMALY"]
+        elif deepfake_score >= 70.0: decision = ANALYSIS_MAP["DEEPFAKE"]
+        elif genai_score >= 80.0: decision = ANALYSIS_MAP["SYNTHETIC"]
         elif genai_score >= 50.0: decision = ANALYSIS_MAP["MODIFIED"]
-        elif safe_semantic_score >= 40.0 or deepfake_score >= 30.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
+        elif safe_semantic_score >= 40.0 or deepfake_score >= 35.0 or genai_score >= 30.0: decision = ANALYSIS_MAP["INCONCLUSIVE"]
         else: decision = ANALYSIS_MAP["AUTHENTIC"]
 
         # storage
