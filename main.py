@@ -436,11 +436,11 @@ async def check_human_face(img_matrix) -> dict:
         face_count = len(detection_result.detections) if detection_result.detections else 0
 
         if face_count == 0:
-            return {"is_valid": False, "error_code": "FACE_NOT_DETECTED", "message": "No valid human face found in the image."}
+            return {"is_valid": False, "error_code": "FACE_NOT_DETECTED", "message": "No valid human face found in the image.", "face_count": 0}
         elif face_count > 1:
-            return {"is_valid": False, "error_code": "MULTIPLE_FACES_DETECTED", "message": "Multiple faces detected. Please upload an image with a single person."}
+            return {"is_valid": False, "error_code": "MULTIPLE_FACES_DETECTED", "message": "Multiple faces detected. Please upload an image with a single person.", "face_count": face_count}
             
-        return {"is_valid": True, "error_code": None, "message": None}
+        return {"is_valid": True, "error_code": None, "message": None, "face_count": face_count}
         
     except Exception as e:
         log_event(level="error", action="face_detection_engine_failed", code="FACE_DETECTION_ENGINE_FAILED", error=str(e))
@@ -730,7 +730,7 @@ async def rate_limiter(request: Request, auth = Depends(get_auth_user)):
     return auth
 
 # called by /v1/analyze
-async def check_daily_limit(request: Request, profile: dict, endpoint: str = None):
+async def check_daily_limit(request: Request, profile: dict, endpoint: str = None, mode: str = None):
     user_id = profile.get("id")
     daily_usage = profile.get("daily_usage", 0)
     last_reset_str = profile.get("last_daily_usage_reset")
@@ -765,7 +765,7 @@ async def check_daily_limit(request: Request, profile: dict, endpoint: str = Non
 
     # Limit Aşım Kontrolü
     if daily_usage >= daily_limit:
-        logger.warning(f"action=daily_limit_exceeded | limit={daily_limit} | user_id={user_id}")
+        log_event(level="warning", action="daily_limit_exceeded", code="DAILY_LIMIT_EXCEEDED", request_id=request_id, user_id=user_id, limit=daily_limit, endpoint=endpoint, mode=mode)
 
         await log_failed_request_to_db(
             user_id=user_id, 
@@ -784,13 +784,18 @@ async def check_daily_limit(request: Request, profile: dict, endpoint: str = Non
                 "error": {
                     "code": "DAILY_LIMIT_EXCEEDED",
                     "message": f"Daily usage limit exceeded: max = {daily_limit}.",
-                    "recommendation": "Please wait until your daily limits reset."
+                    "recommendation": "Please wait until your daily limits reset.",
+                    "details": {
+                        "daily_credits_limit": daily_limit,
+                        "next_reset_time": next_reset_time.isoformat()
+                    }
                 },
                 "meta": {
+                    "credits_used": 0,
+                    "credits_deducted": False,
                     "credits_remaining": profile.get("credits", 0),
-                    "daily_credit_limit": daily_limit,
                     "plan_type": plan_type,
-                    "next_reset_time": next_reset_time.isoformat()
+                    "mode": mode
                 }
             }
         )
@@ -1157,6 +1162,8 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                         "recommendation": "Please upgrade your plan or top up your credits to continue."
                     },
                     "meta": {
+                        "credits_used": 0,
+                        "credits_deducted": False,
                         "credits_remaining": current_credits,
                         "plan_type": plan_type,
                         "mode": "live"
@@ -1165,7 +1172,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             )
         
         # check daily limit
-        await check_daily_limit(request=request, profile=profile_data, endpoint="/v1/analyze")
+        await check_daily_limit(request=request, profile=profile_data, endpoint="/v1/analyze", mode=mode)
 
     try:
         content = await file.read()
@@ -1229,6 +1236,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         if not face_check["is_valid"]:
             face_check_error_code = face_check["error_code"]
             face_check_error_message = face_check["message"]
+            face_count = face_check["face_count"]
 
             log_event(level="warning", action="analysis_rejected", code=face_check_error_code, request_id=request_id, user_id=active_client_id)
             await log_failed_request_to_db(active_client_id, request_id, "/v1/analyze", face_check_error_code, face_check_error_message)
@@ -1241,7 +1249,14 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                     "error": {
                         "code": face_check_error_code,
                         "message": face_check_error_message,
-                        "recommendation": "Please upload a clear photo of a single person. Group photos or distant shots may cause inaccurate results."
+                        "recommendation": "Please upload a clear photo of a single person. Group photos or distant shots may cause inaccurate results.",
+                        **( # face_count birden fazlaysa detaylara ekle (code=MULTIPLE_FACES_DETECTED), yoksa hiç ekleme
+                            {
+                                "details": {
+                                    "faces_found": face_count
+                                }
+                            } if face_count > 1 else {}
+                        )
                     },
                     "meta": {
                         "credits_used": 0,
