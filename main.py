@@ -1580,7 +1580,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                 "status": "failed",
                 "processing_time_ms": get_processing_time(request),
                 "error": {
-                    "code": "INTERNAL_ERROR",
+                    "code": "ANALYSIS_GENERAL_ERROR",
                     "message": "An unexpected internal server error occurred.",
                     "recommendation": "Please contact support if the problem persists."
                 },
@@ -1692,7 +1692,7 @@ async def get_history(request: Request, auth = Depends(management_rate_limiter))
                 "status": "failed",
                 "processing_time_ms": get_processing_time(request),
                 "error": {
-                    "code": "INTERNAL_ERROR",
+                    "code": "HISTORY_FETCH_ERROR",
                     "message": "Could not fetch history.",
                     "recommendation": "Please contact support if the problem persists."
                 }
