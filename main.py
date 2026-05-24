@@ -1543,7 +1543,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             "request_id": request_id,
             "status": "success",
             "processing_time_ms": get_processing_time(request),
-            "results": {
+            "data": {
                 "authenticity_score": authenticity_score,
                 "verdict": {
                     "risk_level": decision["risk_level"],
