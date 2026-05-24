@@ -698,7 +698,7 @@ async def rate_limiter(request: Request, auth = Depends(get_auth_user)):
                     "status": "failed",
                     "processing_time_ms": get_processing_time(request),
                     "error": {
-                        "code": "RATE_LIMIT_EXCEEDED",
+                        "code": "RATE_LIMIT_EXCEEDED_SECOND",
                         "message": "Rate limit (seconds) exceeded.",
                         "recommendation": "Slow down your request rate."
                     }
@@ -715,7 +715,7 @@ async def rate_limiter(request: Request, auth = Depends(get_auth_user)):
                     "status": "failed",
                     "processing_time_ms": get_processing_time(request),
                     "error": {
-                        "code": "RATE_LIMIT_EXCEEDED",
+                        "code": "RATE_LIMIT_EXCEEDED_MINUTE",
                         "message": f"Exceeded minute limit: ({minute_limit} req/min).",
                         "recommendation": "Please wait before making more requests."
                     }
