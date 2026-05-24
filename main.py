@@ -1204,7 +1204,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
         try:
             face_check = await check_human_face(img_matrix)
         except Exception as face_err:
-            log_event(level="error", action="face_detection_failed", code="FACE_DETECTION_ERROR", request_id=request_id, user_id=active_client_id, error=str(face_err))
+            log_event(level="error", action="face_detection_engine_failed", code="FACE_DETECTION_ENGINE_FAILED", request_id=request_id, user_id=active_client_id, error=str(face_err))
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
@@ -1212,7 +1212,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
                     "status": "failed",
                     "processing_time_ms": get_processing_time(request),
                     "error": {
-                        "code": "FACE_DETECTION_ERROR",
+                        "code": "FACE_DETECTION_ENGINE_FAILED",
                         "message": "Face detection service temporarily unavailable.",
                         "recommendation": "Please try again later."
                     },
