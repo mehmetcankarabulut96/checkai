@@ -1,20 +1,28 @@
 
-import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, base64, logging
+import httpx, hashlib, os, uuid, secrets, hmac, json, time, cv2, numpy as np, mediapipe as mp, asyncio, base64, logging, contextvars
 
+from json.decoder import JSONDecodeError
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Request, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
+from postgrest.exceptions import APIError
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client, AuthApiError
-from starlette.requests import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from datetime import datetime, timedelta, timezone
 from openai import AsyncOpenAI
+
+# subsciption
+LS_VARIANT_MAP = {
+    "LITE": "1490345",
+    "PRO": "1490323",
+    "BUSINESS": "1490341"
+}
 
 # security
 MIN_FILE_SIZE = 10 * 1024 # 10 KB (trash)
@@ -165,6 +173,10 @@ VLM_EXPLANATION_MAP = {
 
 app = FastAPI(title="api.cludek.com", version="1.0.0")
 
+ctx_request_id = contextvars.ContextVar("request_id", default=None)
+ctx_user_id = contextvars.ContextVar("user_id", default=None)
+ctx_endpoint = contextvars.ContextVar("endpoint", default=None)
+
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
     # Fırlatılan detail bir sözlük (dict) ise sarmalamadan doğrudan döndür
@@ -215,14 +227,15 @@ console_handler.setFormatter(formatter)
 if logger.hasHandlers(): logger.handlers.clear()
 logger.addHandler(console_handler)
 
-def log_event(level: str, action: str, code: str = None, request_id: str = None, user_id: str = None, **opt_arg):
+def log_event(level: str, action: str, code: str = None, **opt_arg):
     log_data = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "level": level.upper(),
         "action": action,
         "code": code,
-        "request_id": request_id,
-        "user_id": user_id
+        "request_id": ctx_request_id.get(),
+        "user_id": ctx_user_id.get(),
+        "endpoint": ctx_endpoint.get()
     }
     
     # **opt_arg ile gelen ekstra verileri (meta, error, vs.) ana sözlüğe ekle
@@ -255,12 +268,18 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request.state.request_id = request.headers.get("X-Request-ID", f"req_{uuid.uuid4().hex[:12]}")
+        req_id = request.headers.get("X-Request-ID", f"req_{uuid.uuid4().hex[:12]}")
+        
+        t1 = ctx_request_id.set(req_id)
+        t2 = ctx_endpoint.set(request.url.path)
         request.state.start_time = time.time()
 
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.request_id
-        return response
+        try:
+            return await call_next(request)
+        finally:
+            ctx_request_id.reset(t1)
+            ctx_endpoint.reset(t2)
+
 
 app.add_middleware(RequestIDMiddleware)
 
@@ -300,6 +319,11 @@ try:
 except Exception as e:
     log_event(level="critical", action="model_load_failed", code="MODEL_LOAD_ERROR", error=str(e), model="mediapipe_face_detector")
     raise RuntimeError(f"Model load failure: {e}")
+
+def safe_int(value, field):
+    if value is None: raise ValueError(f"{field} is missing")
+    try: return int(value)
+    except (TypeError, ValueError): raise ValueError(f"invalid {field}: {value}")
 
 async def log_failed_request_to_db(user_id: str, request_id: str, endpoint: str, error_code: str, message: str):
     """Kullanıcının iş akışını bozan mantıksal hataları (Business Logic) DB'ye kaydeder."""
@@ -619,6 +643,7 @@ async def get_auth_user(request: Request, api_key: str = Depends(api_key_header)
             )
         
         # user can login
+        ctx_user_id.set(user_id)
         auth_info["profile"] = profile
         return auth_info
 
@@ -2165,136 +2190,129 @@ async def delete_account(request: Request, auth = Depends(management_guard)):
 
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
-    """
-    Inbound webhook receiver for processing asynchronous monetization and subscription events.
-
-    This endpoint acts as the primary ingestion gateway for third-party payment providers 
-    (e.g., Stripe or Lemon Squeezy) to synchronize user billing states with the application:
-    1. Extracts cryptographic headers and executes a constant-time HMAC signature verification 
-       to guarantee request authenticity and mitigate timing attacks.
-    2. Validates structural payload compliance, checking for target metadata like 'user_id' 
-       within custom context blocks.
-    3. Screens critical lifecycle events ('subscription_created', 'subscription_updated', 
-       'subscription_payment_success') against required schema verification rules.
-    4. Coordinates downstream execution flows to mutate database states, provisioning 
-       allocated credits, and adjusting subscriber permission tiers.
-    5. Dispatches telemetry metrics to both console outputs and persistent failure logs.
-
-    Args:
-        request (Request): The raw FastAPI request object containing body streams and headers.
-        # Add any other parameters your function extracts here (e.g., x_signature: str)
-
-    Returns:
-        dict: A simple acknowledgement response (e.g., {"status": "accepted"}) to signal 
-              to the billing provider that the payload was successfully swallowed and processed.
-
-    Raises:
-        HTTPException (401): If the incoming signature is missing, unreadable, or fails 
-                            the constant-time cryptographic verification (INVALID_SIGNATURE).
-        HTTPException (422): If the payload is missing mandatory routing metrics like 'user_id' 
-                            (USER_PARAMETER_MISSING) or presents malformed context structures 
-                            during critical subscription actions (WEBHOOK_SCHEMA_VALIDATION_FAILED).
-        HTTPException (500): If internal business mutations, ledger writes, or external worker 
-                            threads encounter unhandled exceptions (WEBHOOK_PROCESSING_ERROR).
-    """
-    
-    request_id = getattr(request.state, "request_id", None)
-    target_endpoint = request.url.path
+    request_id = ctx_request_id.get()
 
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
     signature = request.headers.get("X-Signature")
 
     body = await request.body()
     
-    # Güvenlik Doğrulaması
     hash_obj = hmac.new(secret, body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(hash_obj, signature):
-        log_event(level="warning", action="webhook_rejected", code="INVALID_SIGNATURE", request_id=request_id, endpoint=target_endpoint)
-        raise_api_error(
-            request=request,
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            error_code="INVALID_SIGNATURE",
-            message="The inbound webhook payload cryptographic signature verification failed.",
-            recommendation="We could not verify the authenticity of this webhook request. Please confirm your webhook signing secret matches your dashboard configuration, ensure you are hashing the raw payload body before parsing, and verify your header matches our expected format."
-        )
+        log_event(level="warning", action="webhook_rejected", code="INVALID_SIGNATURE")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
-    payload = json.loads(body)
-    event_name = payload.get("meta", {}).get("event_name")
-    custom_data = payload.get("meta", {}).get("custom_data", {})
-    user_id = custom_data.get("user_id")
+    try:
+        # assuming that lemon squeezy sends body as json object
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise TypeError("payload must be a dictionary")
 
-    if not user_id:
-        log_event(level="warning", action="webhook_ignored", code="USER_PARAMETER_MISSING", request_id=request_id, event=event_name, endpoint=target_endpoint)
-        raise_api_error(
-            request=request,
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            error_code="USER_PARAMETER_MISSING",
-            message="The request payload is missing a mandatory user identifier.",
-            recommendation="We could not process this webhook because the required 'user_id' parameter is missing from the payload's custom data block. Please ensure your billing integration maps the correct user identity string before re-submitting."
-        )
+        payload_data = payload.get("data")
+        if not isinstance(payload_data, dict):
+            raise TypeError("data must be a dictionary")
 
-    attributes = payload.get("data", {}).get("attributes", {})
-    variant_id = str(attributes.get("variant_id"))
-    billing_reason = attributes.get("billing_reason")
-    sub_status = attributes.get("status")
+        payload_meta = payload.get("meta")
+        if not isinstance(payload_meta, dict):
+            raise TypeError("meta must be a dictionary")
 
-    # BÖCEK AVI
-    log_event(level="info", action="webhook_received", event=event_name, variant_id=variant_id, user_id=user_id, endpoint=target_endpoint)
+        custom_data = payload_meta.get("custom_data")
+        if not isinstance(custom_data, dict):
+            raise TypeError("custom_data must be a dictionary")
+        
+        user_id = custom_data.get("user_id")
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise TypeError("user_id must be a non-empty string")
+        
+        event_name = payload_meta.get("event_name")
+        if not isinstance(event_name, str) or not event_name.strip():
+            raise TypeError("event_name must be a non-empty string")
+        
+        attributes = payload_data.get("attributes")
+        if not isinstance(attributes, dict):
+            raise TypeError("attributes must be a dictionary")
+
+        variant_id = attributes.get("variant_id")
+        if not isinstance(variant_id, str) or not variant_id.isdigit():
+            raise TypeError("variant_id must be an integer or string")
+        variant_id = str(variant_id)
+
+        billing_reason = attributes.get("billing_reason")
+        if not isinstance(billing_reason, str) or not billing_reason.strip():
+            raise TypeError("billing_reason must be a non-empty string")
+
+        sub_status = attributes.get("status")
+        if not isinstance(sub_status, str) or sub_status.strip():
+            raise TypeError("status must be a non-empty string")
+
+    except JSONDecodeError as err:
+        log_event(level="warning", action="webhook_rejected", code="INVALID_JSON", error=str(err))
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+    
+    except TypeError as err:
+        log_event(level="warning", action="webhook_rejected", code="INVALID_PAYLOAD", error=str(err))
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+    LS_EVENT_WHITELIST = ["subscription_created", "subscription_updated", "subscription_payment_success",
+                          "subscription_expired", "subscription_payment_failed", "order_refunded"]
+    if not event_name in LS_EVENT_WHITELIST:
+        log_event(level="error", action="webhook_rejected", code="UNSUPPORTED_EVENT", event=event_name, variant_id=variant_id, cludek_user_id=user_id)
+        return status.HTTP_200_OK
+    
+    # TODO: debug only, remove for production
+    log_event(level="info", action="webhook_received", event=event_name, variant_id=variant_id, cludek_user_id=user_id)
 
     # lemon squeezy variants
-    LITE_VARIANT_ID = "1490345"
-    PRO_VARIANT_ID = "1490323" 
-    BUSINESS_VARIANT_ID = "1490341"
+    # TODO: .get() or [] ?
+    LITE_VARIANT_ID = LS_VARIANT_MAP["LITE"]
+    PRO_VARIANT_ID = LS_VARIANT_MAP["PRO"]
+    BUSINESS_VARIANT_ID = LS_VARIANT_MAP["BUSINESS"]
 
     try:
         now_iso = datetime.now(timezone.utc).isoformat()
         update_data = {}
 
-        # Mevcut veritabanı durumunu çek (Gerçek bir paket değişimi olup olmadığını anlamak için)
         db_profile = await asyncio.to_thread(
-            lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).maybe_single().execute()
+            lambda: supabase.table("profiles").select("plan_type").eq("id", user_id).single().execute()
         )
-        profile_data = getattr(db_profile, "data", None) or {}
+        profile_data = db_profile.data
+        if "plan_type" not in profile_data:
+            log_event(level="warning", action="profile_missing_plan_type", cludek_user_id=user_id)
         db_plan_type = profile_data.get("plan_type", "free")
 
-        # Gelen variant_id'ye göre hedef paketi belirle
         target_plan = "free"
         if variant_id == LITE_VARIANT_ID: target_plan = "lite"
         elif variant_id == PRO_VARIANT_ID: target_plan = "pro"
         elif variant_id == BUSINESS_VARIANT_ID: target_plan = "business"
 
-        # --- EVENT YÖNETİMİ ---
-        # A. Yeni Abonelik (İlk Satın Alım)
+        # --- EVENT MANAGEMENT ---
+        # from below we assume that every field of business checkout link is a string
+        # A. New Subscription (First Purchase)
         if event_name == "subscription_created":
             if target_plan == "business":
-                raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
-                try:
-                    credits = int(raw_credits)
-                except (ValueError, TypeError):
-                    credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
-
                 update_data = {
                     "plan_type": target_plan,
-                    "credits": credits,
+                    "credits": safe_int(custom_data.get("custom_credits"), "custom_credits"),
                     "daily_usage": 0,
                     "last_daily_usage_reset": now_iso,
-                    "custom_rate_limit": custom_data.get("custom_rate_limit"),
-                    "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
-                    "custom_daily_limit": custom_data.get("custom_daily_limit"),
-                    "custom_key_limit": custom_data.get("custom_key_limit")
+                    "custom_rate_limit": safe_int(custom_data.get("custom_rate_limit"), "custom_rate_limit"),
+                    "custom_rate_limit_min": safe_int(custom_data.get("custom_rate_limit_min"), "custom_rate_limit_min"),
+                    "custom_daily_limit": safe_int(custom_data.get("custom_daily_limit"), "custom_daily_limit"),
+                    "custom_key_limit": safe_int(custom_data.get("custom_key_limit"), "custom_key_limit")
                 }
             else:
                 update_data = {
                     "plan_type": target_plan,
-                    "credits": MONTHLY_LIMITS.get(target_plan),
+                    # TODO: .get() or [] ?
+                    "credits": MONTHLY_LIMITS[target_plan],
                     "daily_usage": 0,
                     "last_daily_usage_reset": now_iso
                 }
         
-        # B. Abonelik Güncellenmesi (Kart değişimi, İptal, Upgrade/Downgrade, Resume)
+        # B. Update Subscription (eg. Credit Card Update, Cancel, Upgrade/Downgrade, Resume)
         elif event_name == 'subscription_updated':
             if sub_status in ['past_due', 'unpaid']:
-                # Kredi kartından para çekilemedi, free'ye düşür ve kredileri sıfırla
+                # Charge failed, downgrade to free and set credits to zero
                 update_data = {
                     "plan_type": "free", 
                     "credits": 0, 
@@ -2306,74 +2324,49 @@ async def lemon_squeezy_webhook(request: Request):
                     "custom_key_limit": None
                 }
             elif sub_status == 'cancelled':
-                # İptal edildi, sadece plan tipini koru, krediler olduğu gibi kalır
                 update_data = {"plan_type": target_plan}
             elif sub_status in ['active']:
-                # Sadece gerçek bir paket değişikliği varsa (Upgrade/Downgrade) kredileri yenile
+                # Renew credits only if this is a real plan change (upgrade/downgrade)
                 if target_plan != db_plan_type and target_plan != "free":
                     if target_plan == "business":
-                        raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
-                        try:
-                            credits = int(raw_credits)
-                        except (ValueError, TypeError):
-                            credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
-
                         update_data = {
                             "plan_type": target_plan,
-                            "credits": credits,
+                            "credits": safe_int(custom_data.get("custom_credits"), "custom_credits"),
                             "daily_usage": 0,
                             "last_daily_usage_reset": now_iso,
-                            "custom_rate_limit": custom_data.get("custom_rate_limit"),
-                            "custom_rate_limit_min": custom_data.get("custom_rate_limit_min"),
-                            "custom_daily_limit": custom_data.get("custom_daily_limit"),
-                            "custom_key_limit": custom_data.get("custom_key_limit")
+                            "custom_rate_limit": safe_int(custom_data.get("custom_rate_limit"), "custom_rate_limit"),
+                            "custom_rate_limit_min": safe_int(custom_data.get("custom_rate_limit_min"), "custom_rate_limit_min"),
+                            "custom_daily_limit": safe_int(custom_data.get("custom_daily_limit"), "custom_daily_limit"),
+                            "custom_key_limit": safe_int(custom_data.get("custom_key_limit"), "custom_key_limit")
                         }
                     else:
                         update_data = {
                             "plan_type": target_plan,
-                            "credits": MONTHLY_LIMITS.get(target_plan),
+                            # TODO: .get() or [] ?
+                            "credits": MONTHLY_LIMITS[target_plan],
                             "daily_usage": 0,
                             "last_daily_usage_reset": now_iso
                         }
                 else:
-                    # Paket aynı (sadece kart değişti veya iptalden vazgeçildi). Kredi olduğu gibi kalır
+                    # Same plan (only card change or undo cancelling)
                     update_data = {"plan_type": target_plan}
 
-        # C. Aylık Düzenli Yenileme (Başarılı Tahsilat)
+        # C. Monthly Renewal (Payment Success)
         elif event_name == 'subscription_payment_success':
             if billing_reason == 'initial':
-                log_event(level="info", action="webhook_ignored", code="INITIAL_PAYMENT_HANDLED", request_id=request_id, user_id=user_id, endpoint=target_endpoint)
-                return {
-                    "request_id": request_id,
-                    "status": "success",
-                    "processing_time_ms": get_processing_time(request),
-                    "data": {
-                        "message": "Ignored",
-                        "reason": "Initial payment handled by subscription_created",
-                        "recommendation": "No action needed."
-                    }
-                }
+                log_event(level="info", action="webhook_ignored", code="INITIAL_PAYMENT_SUCCESS", event=event_name, cludek_user_id=user_id)
+                return status.HTTP_200_OK
+            
             elif db_plan_type == "free":
-                log_event(level="info", action="webhook_ignored", code="FREE_PLAN_PAYMENT", request_id=request_id, user_id=user_id, endpoint=target_endpoint)
-                return {
-                    "request_id": request_id,
-                    "status": "success",
-                    "processing_time_ms": get_processing_time(request),
-                    "data": {
-                        "message": "Ignored",
-                        "reason": "Free plan payment success ignored",
-                        "recommendation": "No action needed."
-                    }
-                }
+                log_event(level="info", action="webhook_ignored", code="FREE_PLAN_PAYMENT", event=event_name, cludek_user_id=user_id)
+                return status.HTTP_200_OK
+            
             else:
                 if target_plan == "business":
-                    raw_credits = custom_data.get("custom_credits", DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT)
-                    try:
-                        credits = int(raw_credits)
-                    except (ValueError, TypeError):
-                        credits = DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT
+                    credits = safe_int(custom_data.get("custom_credits"), "custom_credits")
                 else:
-                    credits = MONTHLY_LIMITS.get(target_plan)
+                    # TODO: .get() or [] ?
+                    credits = MONTHLY_LIMITS[target_plan]
 
                 update_data = {
                     "plan_type": target_plan,
@@ -2382,10 +2375,10 @@ async def lemon_squeezy_webhook(request: Request):
                     "last_daily_usage_reset": now_iso
                 }
         
-        # D. Ödeme Başarısız / Süre Bitti / İade Edildi
+        # D. Payment Failed / Subs Expired / Order Refunded
         elif event_name in ['subscription_expired', 'subscription_payment_failed', 'order_refunded']:
-            # Süre bitimi (expired) dışında, başarısız/iade durumlarda sıfır kredi verilir
-            assigned_credits = MONTHLY_LIMITS.get("free") if event_name == 'subscription_expired' else 0
+            # TODO: MONTHLY_LIMITS["free"] or MONTHLY_LIMITS("free", 50) or MONTHLY_LIMITS("free")
+            assigned_credits = MONTHLY_LIMITS["free"] if event_name == 'subscription_expired' else 0
             
             update_data = {
                 "plan_type": "free",
@@ -2398,45 +2391,42 @@ async def lemon_squeezy_webhook(request: Request):
                 "custom_key_limit": None
             }
         
-        # Hazırlanan update_data'yı veritabanına gönder
         if update_data:
             await asyncio.to_thread(
                 lambda: supabase.table("profiles").update(update_data).eq("id", user_id).execute()
             )
-            log_event(level="info", action="webhook_processed_successfully", request_id=request_id, user_id=user_id, event=event_name, updated_plan=update_data.get("plan_type"), endpoint=target_endpoint)
         else:
-            # Bilinen bir event geldi ama hiçbir mantığa girmediyse BURASI KRİTİK
-            if event_name in ['subscription_created', 'subscription_updated', 'subscription_payment_success']:
-                log_event(level="error", action="webhook_unhandled_event", code="WEBHOOK_SCHEMA_VALIDATION_FAILED", request_id=request_id, user_id=user_id, event=event_name, endpoint=target_endpoint)
-                raise_api_error(
-                    request=request,
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    error_code="WEBHOOK_SCHEMA_VALIDATION_FAILED",
-                    message="The webhook event payload could not be processed due to missing or malformed mutation attributes.",
-                    recommendation="We couldn't process this subscription event because the payload data is missing mandatory attributes required for state updates. Please verify that your payment provider configuration transmits complete object contexts, or inspect the raw webhook payload logs.",
-                    meta={
-                        "failed_event": event_name,
-                        "resolved_user": user_id
-                    }
-                )
+            # update_data is None, developers should check this error
+            log_event(level="error", action="webhook_unhandled_properly", code="PROFILE_DATA_SET_ERROR", cludek_user_id=user_id, event=event_name)
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
-        return {
-            "request_id": request_id,
-            "status": "success",
-            "processing_time_ms": get_processing_time(request),
-            "data": {
-                "message": f"Webhook event '{event_name}' processed successfully.",
-                "updated_plan": update_data.get("plan_type")
-            }
-        }
+        # TODO: update_data["plan_type"] or update_data.get("plan_type")
+        log_event(level="info", action="webhook_processed_successfully", cludek_user_id=user_id, event=event_name, event_status=sub_status, recent_plan = db_plan_type, new_plan=update_data["plan_type"])
+        return status.HTTP_200_OK
+    
     except HTTPException:
         raise
-    except Exception as e:
-        log_event(level="error", action="webhook_processing_failed", code="WEBHOOK_PROCESSING_ERROR", request_id=request_id, user_id=user_id, event=event_name, error=str(e), endpoint=target_endpoint)
-        raise_api_error(
-            request=request,
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            error_code="WEBHOOK_PROCESSING_ERROR",
-            message="An unexpected internal error occurred while processing the webhook event payload.",
-            recommendation=f"We encountered an unexpected system error while handling this event payload. If you are the webhook provider, please re-transmit the event using an exponential backoff strategy. For further assistance, contact Cludek support with tracking ID '{request_id}'."
-        )
+
+    except APIError as err:
+        # supabase.table("profiles").select("plan_type").eq("id", user_id).single().execute()
+        # supabase.table("profiles").update(update_data).eq("id", user_id).execute()
+        log_event(level="error", action="supabase_api_error", code="DATABASE_QUERY_FAILED", error=str(err), cludek_user_id=user_id, update_data_keys=list(update_data.keys()))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    except ValueError as err:
+        # if value is None          => f"{field} is missing
+        # try: return int(value)    => f"invalid {field}: {value}
+        log_event(level="warning", action="validation_error", code="BAD_INPUT", error=str(err), cludek_user_id=user_id, target_plan=target_plan)
+        # TODO: log_failed_request_to_db
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
+
+    except KeyError as err:
+        # MONTHLY_LIMITS[target_plan]
+        log_event(level="error", action="config_key_error", code="INVALID_CONFIG_OBJECT", cludek_user_id=user_id, error=str(err), target_plan=target_plan)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    except Exception as err:
+        # supabase.table("profiles").select("plan_type").eq("id", user_id).single().execute()
+        # supabase.table("profiles").update(update_data).eq("id", user_id).execute()
+        log_event(level="critical", action="unexpected_webhook_error", error=str(err), cludek_user_id=user_id)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
