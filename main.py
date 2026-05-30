@@ -75,11 +75,11 @@ PLAN_KEY_LIMITS = {
     "lite": 2,
     "pro": 5
 }
+
 # business package default limits, theese used if data not fount at database
 DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_SECOND = 5
 DEFAULT_BUSINESS_PACKAGE_RATE_LIMIT_MINUTE = 120
 DEFAULT_BUSINESS_PACKAGE_DAILY_CREDITS_LIMIT = 500
-DEFAULT_BUSINESS_PACKAGE_MONTHLY_CREDITS_LIMIT = 5000
 DEFAULT_BUSINESS_PACKAGE_MAX_LIVE_KEY_LIMIT = 20
 
 # decision matrix
@@ -220,6 +220,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.propagate = False
 formatter = logging.Formatter("%(message)s")
+
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.disabled = True
 
 # console logger for development and debugging
 console_handler = logging.StreamHandler()
@@ -2047,37 +2050,6 @@ async def health_check(request: Request):
 
 @app.delete("/account")
 async def delete_account(request: Request, auth = Depends(management_guard)):
-    """
-    Executes the full teardown and erasure lifecycle for a user account.
-
-    This endpoint orchestrates a critical, multi-system cleanup sequence:
-    1. Authenticates the requesting user and validates their active session.
-    2. Queries the upstream payment gateway (Lemon Squeezy) to discover any 
-       active, recurring subscription records linked to the user.
-    3. Issues cancellation commands to the payment gateway if a live billing 
-       agreement is found, preventing accidental subsequent charges.
-    4. Commits a multi-table database transaction to wipe or anonymize user 
-       profile rows, metadata records, and audit flags across all persistence layers.
-    5. Registers system-wide telemetry and audit trails for compliance tracking.
-
-    Args:
-        request (Request): The raw FastAPI request object used to extract route tracking data.
-        # Add any other parameters your function takes here (e.g., active_client_id, db_session)
-
-    Returns:
-        dict: A success payload indicating successful execution of the account closure pipeline.
-
-    Raises:
-        HTTPException (401): If the request lacks valid authentication tokens.
-        HTTPException (500): If the payment gateway fails to return subscription records 
-                            (SUBSCRIPTION_FETCH_FAILED) or fails to process a cancellation 
-                            (SUBSCRIPTION_CANCEL_FAILED).
-        HTTPException (500): If the upstream payment gateway times out or drops the connection 
-                            (PAYMENT_GATEWAY_ERROR).
-        HTTPException (500): If the internal identity or database framework fails to commit 
-                            the profile erasure transaction (ACCOUNT_DELETION_ERROR).
-    """
-
     active_client_id = auth["id"]
     request_id = getattr(request.state, "request_id", None)
     target_endpoint = request.url.path
@@ -2190,8 +2162,6 @@ async def delete_account(request: Request, auth = Depends(management_guard)):
 
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
 async def lemon_squeezy_webhook(request: Request):
-    request_id = ctx_request_id.get()
-
     secret = os.getenv("LEMON_SQUEEZY_WEBHOOK_SECRET").encode('utf-8')
     signature = request.headers.get("X-Signature")
 
@@ -2417,7 +2387,7 @@ async def lemon_squeezy_webhook(request: Request):
         # if value is None          => f"{field} is missing
         # try: return int(value)    => f"invalid {field}: {value}
         log_event(level="warning", action="validation_error", code="BAD_INPUT", error=str(err), cludek_user_id=user_id, target_plan=target_plan)
-        # TODO: log_failed_request_to_db
+        log_failed_request_to_db(user_id, ctx_request_id.get(), ctx_endpoint.get(), "BAD_INPUT", str(err))
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
     except KeyError as err:
