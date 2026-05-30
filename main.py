@@ -257,6 +257,8 @@ def log_event(level: str, action: str, code: str = None, **opt_arg):
         logger.error(message)
     elif level.upper() == "CRITICAL":
         logger.critical(message)
+    elif level.upper() == "DEBUG":
+        logger.debug(message)
 
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -556,7 +558,7 @@ async def get_auth_user(request: Request, api_key: str = Depends(api_key_header)
         if result.data:
             user_id = result.data[0]["user_id"]
             auth_info = {"id": user_id, "is_test": api_key.startswith("sk_test_"), "auth_type": "api_key"}
-            log_event(level="info", action="auth_success", request_id=request_id, user_id=user_id, auth_type="api_key", key_hash=hashed_key)
+            log_event(level="debug", action="auth_success", request_id=request_id, user_id=user_id, auth_type="api_key", key_hash=hashed_key)
         else:
             log_event(level="warning", action="auth_failed", code="INVALID_API_KEY", request_id=request_id, user_id=user_id, key_hash=hashed_key)
             raise_api_error(
@@ -595,7 +597,7 @@ async def get_auth_user(request: Request, api_key: str = Depends(api_key_header)
 
             auth_info = {"id": user_id, "is_test": False, "auth_type": "jwt", "provider": user_response.user.app_metadata.get("provider")}
 
-            log_event(level="info", action="auth_success", request_id=request_id, user_id=user_id, auth_type="jwt")
+            log_event(level="debug", action="auth_success", request_id=request_id, user_id=user_id, auth_type="jwt")
         except Exception as e:
             log_event(level="error", action="jwt_validation_exception", code="AUTH_SYSTEM_ERROR", request_id=request_id, error=str(e), endpoint=target_endpoint)
             raise_api_error(
