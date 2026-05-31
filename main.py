@@ -2037,7 +2037,7 @@ async def get_me(request: Request, auth = Depends(management_guard)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             error_code="INVALID_PROFILE_DATA",
             message="The user profile data is missing or corrupted.",
-            recommendation="Please try logout and re-login. If the issue persists, contact support."
+            recommendation="Please try re-login. If the issue persists, contact support."
         )
 
     provider = auth.get("provider")
