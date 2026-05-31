@@ -2043,11 +2043,10 @@ async def get_me(request: Request, auth = Depends(management_guard)):
         }
     }
 
-@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get("/health")
 async def health_check(request: Request):
-    """Frontend dashboard alanının sistem durumunu takip ettiği açık endpoint."""
     return {
-        "request_id": getattr(request.state, "request_id", None),
+        "request_id": ctx_request_id.get(),
         "status": "success",
         "processing_time_ms": get_processing_time(request),
         "data": {
@@ -2240,8 +2239,7 @@ async def delete_account(request: Request):
             "status": "success",
             "processing_time_ms": get_processing_time(request),
             "data": {
-                "message": "Account and all associated data have been permanently deleted.",
-                "user_id": active_client_id
+                "message": "Account and all associated data have been permanently deleted."
             }
         }
     
