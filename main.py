@@ -1977,10 +1977,10 @@ def login(request: Request, user: UserLogin):
             "email": user.email,
             "password": user.password
         })
-
+        
         # check waitlist
         user_id = response.user.id
-        profile_res = supabase.table("profiles").select("is_allowed").eq("id", user_id).maybe_single().execute()
+        profile_res = supabase.table("profiles").select("is_allowed").eq("id", user_id).execute()
         is_allowed = profile_res.data.get("is_allowed", False) if profile_res.data else False
 
         log_event(level="info", action="login_success", request_id=request_id, user_id=user_id, email=user.email, is_allowed=is_allowed, endpoint=target_endpoint)
