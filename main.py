@@ -2029,13 +2029,24 @@ def login(request: Request, user: UserLogin):
 
 @app.get("/me")
 async def get_me(request: Request, auth = Depends(management_guard)):
-    user_id = auth.get("id")
-    request_id = getattr(request.state, "request_id", None)
+    profile = auth.get("profile")
+    if profile is None or isinstance(profile, dict) is False:
+        log_event(level="error", action="profile_data_resolve_failed", code="INVALID_PROFILE_DATA", resolved_type=str(type(profile)))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="INVALID_PROFILE_DATA",
+            message="The user profile data is missing or corrupted.",
+            recommendation="Please try logout and re-login. If the issue persists, contact support."
+        )
 
-    profile = auth.get("profile", {})
-    profile["app_metadata"] = {"provider": auth.get("provider")}
+    provider = auth.get("provider")
+    if provider is None:
+        log_event(level="error", action="provider_not_found", code="MISSING_PROVIDER_DATA")
+
+    profile["app_metadata"] = {"provider": provider}
     return {
-        "request_id": request_id,
+        "request_id": ctx_request_id.get(),
         "status": "success",
         "processing_time_ms": get_processing_time(request),
         "data": {
