@@ -177,23 +177,31 @@ ctx_request_id = contextvars.ContextVar("request_id", default=None)
 ctx_user_id = contextvars.ContextVar("user_id", default=None)
 ctx_endpoint = contextvars.ContextVar("endpoint", default=None)
 
+def get_processing_time(request: Request) -> int:
+    start_time = getattr(request.state, "start_time", time.time())
+    return int((time.time() - start_time) * 1000)
+
 @app.exception_handler(HTTPException)
 async def custom_http_exception_handler(request: Request, exc: HTTPException):
-    # Fırlatılan detail bir sözlük (dict) ise sarmalamadan doğrudan döndür
     if isinstance(exc.detail, dict):
         return JSONResponse(
             status_code=exc.status_code,
             content=exc.detail
         )
-    # Standart string hataları için varsayılan FastAPI sarmalını koru
+
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail}
+        content={
+            "request_id": ctx_request_id.get(),
+            "status": "failed",
+            "processing_time_ms": get_processing_time(request),
+            "error": {
+                "code": "CLUDEK_DEFAULT_ERROR_CODE",
+                "message": exc.detail,
+                "recommendation": ""
+            }
+        }
     )
-
-def get_processing_time(request: Request) -> int:
-    start_time = getattr(request.state, "start_time", time.time())
-    return int((time.time() - start_time) * 1000)
 
 def raise_api_error(request: Request, status_code: int, error_code: int, message: str, recommendation: str, details: dict = None, meta: dict = None):
     error_payload = {
@@ -2050,20 +2058,23 @@ async def health_check(request: Request):
         }
     }
 
-@app.delete("/account")
-async def delete_account(request: Request, auth = Depends(management_guard)):
-    active_client_id = auth["id"]
-    request_id = getattr(request.state, "request_id", None)
-    target_endpoint = request.url.path
+@app.delete("/account", dependencies=[Depends(management_guard)])
+async def delete_account(request: Request):
+    active_client_id = ctx_user_id.get()
 
-    # Lemon Squeezy Abonelik İptali
+    # Cancel Lemon Squeezy Subscriptions
     try:
         user_auth_info = await asyncio.to_thread(
             lambda: supabase.auth.admin.get_user_by_id(active_client_id)
         )
-        user_email = user_auth_info.user.email
+        # assuming that user_auth_info is not None
+        user_data = user_auth_info.user
+        if isinstance(user_data, dict):
+            raise ValueError("User data must be a dictionary")
 
-        if user_email:
+        user_email = user_data.email
+
+        if isinstance(user_email, str) and user_email.strip():
             ls_api_key = os.getenv("LEMON_SQUEEZY_API_KEY")
             headers = {
                 "Accept": "application/vnd.api+json",
@@ -2075,91 +2086,183 @@ async def delete_account(request: Request, auth = Depends(management_guard)):
                 f"https://api.lemonsqueezy.com/v1/subscriptions?filter[user_email]={user_email}",
                 headers=headers
             )
-            
+
             if ls_response.status_code == 200:
-                ls_data = ls_response.json().get("data", [])
+                payload = ls_response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("response is not a dictionary")
+                
+                ls_data = payload.get("data", [])
+                if not isinstance(ls_data, list):
+                    raise ValueError("response.data is not a list")
+
                 for sub in ls_data:
+                    if not isinstance(sub, dict):
+                        continue
+
                     sub_id = sub.get("id")
-                    if sub.get("attributes", {}).get("status") in ["active", "paused", "past_due"]:
+                    if not isinstance(sub_id, str) or not sub_id.strip():
+                        raise TypeError("Subscription id must be a valid string")
+                    
+                    sub_attrs = sub.get("attributes")
+                    if not isinstance(sub_attrs, dict):
+                        raise TypeError("Subscription attributes must be a dictionary")
+
+                    sub_status = sub_attrs.get("status")
+                    if not isinstance(sub_status, str) or not sub_status.strip():
+                        raise TypeError("Subscription status must be a valid string")
+                    
+                    if sub_status in ["active", "paused", "past_due"]:
                         cancel_res = await http_client.delete(
                             f"https://api.lemonsqueezy.com/v1/subscriptions/{sub_id}",
                             headers=headers
                         )
-                        # API'ye ulaşıldı ama iptal reddedildi
+                        # Subscription cancel denied from ls
                         if cancel_res.status_code != 200:
-                            log_event(level="error", action="account_delete_ls_cancel_failed", code="SUBSCRIPTION_CANCEL_FAILED", request_id=request_id, user_id=active_client_id, sub_id=sub_id, status_code=cancel_res.status_code, endpoint=target_endpoint)
+                            log_event(level="error", action="account_delete_failed", code="SUBSCRIPTION_CANCEL_FAILED", sub_id=sub_id, status_code=cancel_res.status_code)
                             raise_api_error(
                                 request=request,
                                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 error_code="SUBSCRIPTION_CANCEL_FAILED",
-                                message="Failed to process the subscription cancellation sequence.",
-                                recommendation=f"We encountered a temporary issue connecting to our billing provider while processing your cancellation. Please try again in a few moments. If the problem continues, contact Cludek support with tracking ID '{request_id}' so we can verify your subscription is stopped manually."
+                                message="Failed to cancel subscription.",
+                                recommendation="Please try again or contact support."
                             )
+                log_event(level="info", action="subscription_cancel_successful", cancelled_subs_count=len(ls_data))
             else:
-                # Abonelikler listelenemedi
-                log_event(level="error", action="account_delete_ls_fetch_failed", code="SUBSCRIPTION_FETCH_FAILED", request_id=request_id, user_id=active_client_id, status_code=ls_response.status_code, endpoint=target_endpoint)
+                # Cannot fetch subscriptions
+                log_event(level="error", action="account_delete_failed", code="SUBSCRIPTION_FETCH_FAILED", status_code=ls_response.status_code)
                 raise_api_error(
                     request=request,
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     error_code="SUBSCRIPTION_FETCH_FAILED",
-                    message="Failed to retrieve active subscription lifecycle records.",
-                    recommendation=f"We encountered a temporary issue retrieving your billing details from our payment provider. Please try your request again in a few moments. If the issue continues, please contact Cludek support with tracking ID '{request_id}' so we can assist with closing your account.",
-                    meta={
-                        "gateway_status": ls_response.status_code
-                    }
+                    message="Failed to fetch active subscription(s).",
+                    recommendation="Please try again or contact support."
                 )
+        else:
+            raise ValueError("Email must be a valid string")
+
     except HTTPException:
         raise
-    except Exception as ls_err:
-        # API'ye hiç ulaşılamadı (Network hatası vb.)
-        log_event(level="error", action="account_delete_ls_lookup_failed", code="PAYMENT_GATEWAY_ERROR", request_id=request_id, user_id=active_client_id, error=str(ls_err), endpoint=target_endpoint)
+
+    except (ValueError, TypeError) as err:
+        log_event(level="error", action="account_delete_failed", code="INVALID_DATA_FORMAT", error=str(err))
         raise_api_error(
             request=request,
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            error_code="PAYMENT_GATEWAY_ERROR",
-            message="The upstream payment gateway infrastructure is temporarily unreachable.",
-            recommendation=f"We encountered an unexpected connection error while reaching our billing provider. Please try your request again in a few moments. If this issue continues, please contact Cludek support with tracking ID '{request_id}' so we can investigate."
+            error_code="INTERNAL_DATA_FAULT",
+            message="Encountered an unexpected data format while processing account deletion.",
+            recommendation="Please try again or contact support."
         )
 
-    # Storage Temizliği
+    except AuthApiError as err:
+        log_event(level="error", action="account_delete_failed", code="AUTH_PROVIDER_FAILED", error=str(err))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="AUTH_PROVIDER_FAILED",
+            message="Failed to verify account identity with the authentication provider.",
+            recommendation="Please try again or contact support."
+        )
+
+    except (httpx.RequestError, httpx.TimeoutException) as err:
+        log_event(level="error", action="account_delete_failed", code="UPSTREAM_SERVICE_UNREACHABLE", error=str(err))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            error_code="UPSTREAM_SERVICE_UNREACHABLE",
+            message="A required upstream service is temporarily unreachable or timed out.",
+            recommendation="Please try again in a minute."
+        )
+
+    except JSONDecodeError as err:
+        log_event(level="error", action="account_delete_failed", code="INVALID_UPSTREAM_RESPONSE", error=str(err))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="INVALID_UPSTREAM_RESPONSE",
+            message="Received an invalid response format from the billing provider.",
+            recommendation="Please contact support if this issue persists."
+        )
+
+    except Exception as err:
+        log_event(level="error", action="account_delete_failed", code="UNEXPECTED_EXCEPTION", error=str(err))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="INTERNAL_SERVER_ERROR",
+            message="An unexpected internal error occurred while deleting your account.",
+            recommendation="Please try again or contact support."
+        )
+
+    # Clear Storage
     try:
         folder_files = await asyncio.to_thread(
             lambda: supabase.storage.from_("images").list(path=active_client_id)
         )
-        if folder_files:
-            files_to_delete = [f"{active_client_id}/{f['name']}" for f in folder_files]
-            await asyncio.to_thread(
-                lambda: supabase.storage.from_("images").remove(files_to_delete)
-            )
-            log_event(level="info", action="account_delete_storage_cleared", request_id=request_id, user_id=active_client_id, file_count=len(files_to_delete), endpoint=target_endpoint)
-    except Exception as storage_err:
-        log_event(level="error", action="account_delete_storage_failed_ignored", request_id=request_id, user_id=active_client_id, error=str(storage_err), endpoint=target_endpoint)
+        if not isinstance(folder_files, list):
+            log_event(level="error", action="storage_cleanup_failed", code="INVALID_DATA_FORMAT", error="supabase storage returned an unsupported type, image data must be a list")
 
-    # Supabase Auth Silme İşlemi, DB Cascade ve Set Null tetiklenir
+        if folder_files:
+            files_to_delete = []
+    
+            for file_obj in folder_files:
+                file_name = file_obj.get("name")
+                if not isinstance(file_name, str) or not file_name.strip():
+                    # we do not raise exception, cronjob can clear orphan images
+                    log_event(level="error", action="image_deletion_skipped", code="IMAGE_NAME_NOT_FOUND")
+                    continue
+
+                files_to_delete.append(f"{active_client_id}/{file_name}")
+
+            if files_to_delete:
+                await asyncio.to_thread(
+                    lambda: supabase.storage.from_("images").remove(files_to_delete)
+                )
+                log_event(level="info", action="storage_clear_successful", deleted_file_count=len(files_to_delete))
+        
+    except APIError as err:
+        log_event(level="error", action="storage_cleanup_failed", code="STORAGE_API_FAILED", error=str(err))
+    
+    except httpx.HTTPError as err:
+        log_event(level="error", action="storage_cleanup_failed", code="STORAGE_UNREACHABLE", error=str(err))
+    
+    except Exception as storage_err:
+        log_event(level="error", action="storage_cleanup_failed", code="STORAGE_UNKNOWN_ERROR", error=str(err))
+
+    # Delete from Supabase Auth table(triggers the on delete cascade)
     try:
         await asyncio.to_thread(
             lambda: supabase.auth.admin.delete_user(active_client_id)
         )
-        log_event(level="info", action="account_deleted_successfully", request_id=request_id, user_id=active_client_id, endpoint=target_endpoint)
+        log_event(level="info", action="account_delete_successful")
         return {
-            "request_id": request_id,
+            "request_id": ctx_request_id.get(),
             "status": "success",
             "processing_time_ms": get_processing_time(request),
             "data": {
-                "message": "Account and all associated data have been permanently deleted."
-            },
-            "meta": {
+                "message": "Account and all associated data have been permanently deleted.",
                 "user_id": active_client_id
             }
         }
-    except Exception as e:
-        log_event(level="error", action="account_deletion_failed", code="ACCOUNT_DELETION_ERROR", request_id=request_id, user_id=active_client_id, error=str(e), endpoint=target_endpoint)
+    
+    except httpx.HTTPError as err:
+        log_event(level="error", action="account_delete_failed", code="SUPABASE_API_ERROR", error=str(err))
         raise_api_error(
             request=request,
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            error_code="ACCOUNT_DELETION_ERROR",
-            message="An unexpected internal error occurred during the account deletion sequence.",
-            recommendation=f"We encountered an unexpected system error while closing your account. Please try your request again in a few moments. If the issue continues, please contact Cludek support with tracking ID '{request_id}' so we can complete your account closure manually."
+            error_code="SUPABASE_API_ERROR",
+            message="An error occured while deleting the account.",
+            recommendation="Please try again or contact support."
+        )
+    
+    except Exception as err:
+        log_event(level="error", action="account_delete_failed", code="UNEXPECTED_EXCEPTION", error=str(err))
+        raise_api_error(
+            request=request,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            error_code="INTERNAL_SERVER_ERROR",
+            message="An unexpected internal error occurred while deleting your account.",
+            recommendation="Please try again or contact support."
         )
 
 @app.post("/webhook/lemonsqueezy", include_in_schema=False)
