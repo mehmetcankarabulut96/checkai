@@ -1579,7 +1579,7 @@ async def analyze_image(request: Request, file: UploadFile = File(...), auth = D
             rpc_response = await asyncio.to_thread(
                 lambda: supabase.rpc("process_analysis_billing", {"user_id": active_client_id}).execute()
             )
-            if not rpc_response or getattr(rpc_response, "data", None):
+            if not rpc_response or not getattr(rpc_response, "data", None):
                 raise Exception("billing data not found")
             
             new_credits = rpc_response.data
