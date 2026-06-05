@@ -1,7 +1,13 @@
 # Cludek Backend - Visual Intelligence API
 
-This repository contains the backend for Cludek. It is built with **FastAPI**, **Supabase**, and **Lemon Squeezy**. 
-The API handles secure image uploads and runs them through a pipeline using **MediaPipe** (Computer Vision Library), **Sightengine** (Moderation API) and **gpt-4o-mini** (OpenAI API) to detect and moderate content. Swagger documentation can be found at **api.cludek.com/docs**.
+This repository contains the backend for cludek.com. Cludek provides a high-performance, developer-first API designed to detect synthetic media, face-swap deepfakes, and complex semantic or logical anomalies in facial imagery. By combining traditional technical image forensics with state-of-the-art Visual Language Modeling (VLM), Cludek delivers a comprehensive multi-layered authenticity assessment. This allows platforms to secure their identity verification (KYC), trust & safety workflows, and user content pipelines against advanced AI generation and digital spoofing in real-time. 
+
+It is built with **FastAPI**, **Supabase**, and **Lemon Squeezy**. 
+The API handles secure image uploads and runs them through a pipeline using **MediaPipe** (Computer Vision Library), **Sightengine** (Moderation API) and **gpt-4o-mini** (OpenAI API) to detect and moderate content. 
+
+API documentation can be found at **cludek.com/docs**.
+
+Swagger documentation can be found at **api.cludek.com/docs**.
 
 ---
 
