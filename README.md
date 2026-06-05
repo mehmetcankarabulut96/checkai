@@ -1,7 +1,7 @@
 # Cludek Backend - Visual Intelligence API
 
 This repository contains the backend for Cludek. It is built with **FastAPI**, **Supabase**, and **Lemon Squeezy**. 
-The API handles secure image uploads and runs them through a pipeline using **MediaPipe** (Computer Vision Library), **Sightengine** (Moderation API) and **gpt-4o-mini** (OpenAI API) to detect and moderate content.
+The API handles secure image uploads and runs them through a pipeline using **MediaPipe** (Computer Vision Library), **Sightengine** (Moderation API) and **gpt-4o-mini** (OpenAI API) to detect and moderate content. Swagger documentation can be found at **api.cludek.com/docs**.
 
 ---
 
@@ -10,29 +10,31 @@ The API handles secure image uploads and runs them through a pipeline using **Me
 ### 1. Standard API Responses
 Every endpoint returns a consistent JSON structure. This makes frontend integration much easier because you always know what format to expect, whether it's a success or an error.
 
-* **Success Response:**
+**Success Response:**
+```json
+{
+  "request_id": "9a3f8b1c-7e4d-4c8a-921b-6f3c5a7e1f9b",
+  "status": "success",
+  "processing_time_ms": 142,
+  "data": { "system_status": "operational" },
+  "meta": { "timestamp": "2026-06-05T05:46:21Z" }
+}
+```
 
-    {
-      "request_id": "9a3f8b1c-7e4d-4c8a-921b-6f3c5a7e1f9b",
-      "status": "success",
-      "processing_time_ms": 142,
-      "data": { "system_status": "operational" },
-      "meta": { "timestamp": "2026-06-05T05:46:21Z" }
-    }
-
-* **Error Response:**
-
-    {
-      "request_id": "3c5a7e1f-9b9a-3f8b-1c7e-4d4c8a921b6f",
-      "status": "error",
-      "processing_time_ms": 18,
-      "error": {
-        "code": "PROFILE_DATA_FAULT",
-        "message": "The user profile session data is corrupted.",
-        "recommendation": "Please re-authenticate."
-      }
-    }
-
+**Error Response:**
+```json
+{
+  "request_id": "3c5a7e1f-9b9a-3f8b-1c7e-4d4c8a921b6f",
+  "status": "error",
+  "processing_time_ms": 18,
+  "error": {
+    "code": "PROFILE_DATA_FAULT",
+    "message": "The user profile session data is corrupted.",
+    "recommendation": "Please re-authenticate.",
+    "details": null
+  }
+}
+```
 ### 2. Secure Webhooks (Saga Pattern)
 The app integrates with Lemon Squeezy for payments. Webhooks are verified using HMAC-SHA256 signatures. If a user buys credits but the Supabase database update fails, the system rolls back the transaction to prevent broken states.
 
